@@ -2,6 +2,35 @@
 
 Claude Remote lets you use Claude Code on your own computers from your Android phone, from anywhere. A small bridge runs on each computer and drives Claude Code through the Claude Agent SDK, using that computer's Claude Code login, settings, `CLAUDE.md` files and tools. The phone app connects to the bridge over [Tailscale](https://tailscale.com), so nothing is exposed to the internet. Sessions live on the computer: start one from the phone, put the phone away, and Claude Code keeps working. Its background tasks and subagents keep running too. When you open the app again, the chat is where it left off.
 
+## Quick start
+
+You need [Tailscale](https://tailscale.com/download) on your computer **and** your phone (same account), and [Node.js](https://nodejs.org) 20+ on the computer.
+
+**1. On the computer**, install the bridge. It starts now and at every login:
+
+```powershell
+# Windows (PowerShell)
+irm https://raw.githubusercontent.com/karan-suthar03/claude-remote/main/install.ps1 | iex
+```
+```sh
+# macOS / Linux
+curl -fsSL https://raw.githubusercontent.com/karan-suthar03/claude-remote/main/install.sh | sh
+```
+
+It ends by printing the address to use, like `100.101.102.103`.
+
+**2. On the phone**, install the app: **[download claude-remote.apk](https://github.com/karan-suthar03/claude-remote/releases/latest/download/claude-remote.apk)** (Android 8+; allow installs from your browser when asked). Open it, tap **Add device**, and enter that address. If Claude Code on the computer isn't signed in yet, tap **Sign in** on the device screen.
+
+That's it: tap **New session**, pick a folder, and talk to Claude Code.
+
+### Or let Claude Code set it up
+
+If you use Claude Code, paste this into it on the computer:
+
+> Set up Claude Remote on this computer by following https://github.com/karan-suthar03/claude-remote/blob/main/SETUP.md
+
+[SETUP.md](SETUP.md) walks it through checking Node and Tailscale, installing and verifying the bridge, and telling you what to enter in the app.
+
 ## Features
 
 - **Several computers.** Every computer running the bridge is a device in the app's side drawer, with a dot that shows whether it's connected.
@@ -40,12 +69,15 @@ One bridge runs on each computer. The phone keeps no chat history of its own. It
 |---|---|
 | Computer | Windows, macOS or Linux |
 | Computer | [Node.js](https://nodejs.org) 20 or newer |
-| Computer | [Claude Code](https://docs.claude.com/en/docs/claude-code). Sign in with a Claude plan that includes Claude Code (Pro, Max, Team or Enterprise) or with an Anthropic Console account. You can also sign in from the app later. |
+| Computer | A Claude plan that includes Claude Code (Pro, Max, Team or Enterprise) or an Anthropic Console account. Claude Code itself comes with the bridge; sign in from the app or by running `claude` once. |
 | Computer **and** phone | [Tailscale](https://tailscale.com/download), signed in to the **same** tailnet |
-| Phone | Android 12 (API 31) or newer |
+| Phone | Android 8.0 (API 26) or newer |
 | To build the app | Android Studio, or JDK 17 plus the Android SDK 36 (see [docs/BUILD.md](docs/BUILD.md)) |
 
-## Setup
+## Manual setup
+
+The installers above do all of this. To set it up by hand, or to run it from a clone:
+
 
 1. **Install Tailscale on the computer and on the phone.** Sign in to the same account on both and check that both show as connected. Find the computer's Tailscale IP: run `tailscale ip -4`, or look in the Tailscale app. It looks like `100.x.y.z`.
 
@@ -57,8 +89,8 @@ One bridge runs on each computer. The phone keeps no chat history of its own. It
 
 3. **Start the bridge on the computer.**
    ```sh
-   git clone <this repo>
-   cd claude-remote-access/server
+   git clone https://github.com/karan-suthar03/claude-remote.git
+   cd claude-remote/server
    npm install
    npm start
    ```

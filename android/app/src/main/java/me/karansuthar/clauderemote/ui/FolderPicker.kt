@@ -44,6 +44,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.Immutable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -71,8 +72,10 @@ import org.json.JSONObject
 
 private const val RECENT_MAX = 8
 
+@Immutable
 private data class FolderEntry(val name: String, val path: String)
 
+@Immutable
 private data class FolderListing(val path: String, val parent: String?, val dirs: List<FolderEntry>)
 
 /** The last component of [path] ("C:\work\app" -> "app", "/home/me/" -> "me"); the path itself for roots. */
@@ -376,14 +379,14 @@ fun FolderPicker(client: BridgeClient, onBack: () -> Unit, onOpened: (key: Strin
                             LazyColumn(modifier = Modifier.fillMaxSize()) {
                                 if (recent.isNotEmpty()) {
                                     item(key = "__recentHeader") { PickerHeader("Recent folders") }
-                                    items(recent, key = { "r:" + it.path }) { folder ->
+                                    items(recent, key = { "r:" + it.path }, contentType = { "folder" }) { folder ->
                                         FolderRow(icon = Icons.Filled.History, label = folder.name, sub = folder.path) {
                                             navigate(folder.path)
                                         }
                                     }
                                 }
                                 item(key = "__rootsHeader") { PickerHeader("Locations") }
-                                items(list, key = { "l:" + it.path }) { root ->
+                                items(list, key = { "l:" + it.path }, contentType = { "folder" }) { root ->
                                     val icon = if (root.name.equals("Home", ignoreCase = true)) {
                                         Icons.Filled.Home
                                     } else {
@@ -399,11 +402,17 @@ fun FolderPicker(client: BridgeClient, onBack: () -> Unit, onOpened: (key: Strin
 
                     current != null -> {
                         val query = filter.trim()
-                        val visible = if (showHidden) current.dirs else current.dirs.filterNot { it.name.startsWith(".") }
-                        val dirs = if (query.isEmpty()) {
-                            visible
-                        } else {
-                            visible.filter { it.name.contains(query, ignoreCase = true) }
+                        // Folders can number in the thousands: filter only when the listing, the
+                        // hidden toggle or the query changes, not on every recomposition.
+                        val visible = remember(current, showHidden) {
+                            if (showHidden) current.dirs else current.dirs.filterNot { it.name.startsWith(".") }
+                        }
+                        val dirs = remember(visible, query) {
+                            if (query.isEmpty()) {
+                                visible
+                            } else {
+                                visible.filter { it.name.contains(query, ignoreCase = true) }
+                            }
                         }
                         val hiddenCount = current.dirs.size - visible.size
                         LazyColumn(modifier = Modifier.fillMaxSize()) {
@@ -446,7 +455,7 @@ fun FolderPicker(client: BridgeClient, onBack: () -> Unit, onOpened: (key: Strin
                                     }
                                 }
                             } else {
-                                items(dirs, key = { "d:" + it.path }) { dir ->
+                                items(dirs, key = { "d:" + it.path }, contentType = { "folder" }) { dir ->
                                     FolderRow(icon = Icons.Filled.Folder, label = dir.name) {
                                         navigate(dir.path)
                                     }

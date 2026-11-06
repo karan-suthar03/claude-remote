@@ -58,6 +58,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.Immutable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -90,6 +91,7 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.repeatOnLifecycle
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import me.karansuthar.clauderemote.App
@@ -354,7 +356,7 @@ fun AddDeviceDialog(onDismiss: () -> Unit, onAdd: (url: String, name: String) ->
                     singleLine = true,
                     isError = error != null,
                     supportingText = {
-                        Text(error ?: "The computer's Tailscale IP. The bridge must be running there (\"npm start\" in the server folder).")
+                        Text(error ?: "The 100.x.y.z address the installer printed (the computer's Tailscale IP).")
                     },
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri, autoCorrectEnabled = false),
                     shape = MaterialTheme.shapes.small,
@@ -482,32 +484,35 @@ private fun SettingsSection(title: String) {
 
 @Composable
 fun SetupScreen(onAdd: () -> Unit) {
-    val code = SpanStyle(
-        fontFamily = MonoFamily,
-        fontSize = 14.sp,
-        color = MaterialTheme.colorScheme.onSurface,
-        background = MaterialTheme.colorScheme.surfaceContainerHighest,
-    )
-    val steps = listOf(
-        buildAnnotatedString {
-            append("Install Tailscale on this phone and your computer, signed in to the same account.")
-        },
-        buildAnnotatedString {
-            append("On the computer, install Node.js 20+ and Claude Code, then run ")
-            withStyle(code) { append("claude") }
-            append(" once to sign in.")
-        },
-        buildAnnotatedString {
-            append("In this project's server folder run ")
-            withStyle(code) { append("npm install") }
-            append(", then ")
-            withStyle(code) { append("npm start") }
-            append(". It prints the address it listens on.")
-        },
-        buildAnnotatedString {
-            append("Add the computer here with its Tailscale IP (100.x.y.z).")
-        },
-    )
+    val onSurface = MaterialTheme.colorScheme.onSurface
+    val codeBg = MaterialTheme.colorScheme.surfaceContainerHighest
+    // Built once per colour scheme rather than on every recomposition.
+    val steps = remember(onSurface, codeBg) {
+        val code = SpanStyle(
+            fontFamily = MonoFamily,
+            fontSize = 14.sp,
+            color = onSurface,
+            background = codeBg,
+        )
+        listOf(
+            buildAnnotatedString {
+                append("Install Tailscale on this phone and your computer, signed in to the same account.")
+            },
+            buildAnnotatedString {
+                append("On the computer (with Node.js 20+), run the one-line installer from ")
+                withStyle(code) { append("github.com/karan-suthar03/claude-remote") }
+                append(". Or ask Claude Code there to set up Claude Remote.")
+            },
+            buildAnnotatedString {
+                append("The installer prints an address like ")
+                withStyle(code) { append("100.x.y.z") }
+                append(". Add the computer here with it.")
+            },
+            buildAnnotatedString {
+                append("If Claude Code isn't signed in on the computer, sign in from the device screen.")
+            },
+        )
+    }
     Column(
         Modifier
             .fillMaxSize()
@@ -568,6 +573,7 @@ fun SetupScreen(onAdd: () -> Unit) {
 
 // ---------------------------------------------------------------- device home
 
+@Immutable
 private data class SessionRow(
     val key: String?,
     val sessionId: String?,
@@ -575,6 +581,8 @@ private data class SessionRow(
     val title: String,
     val running: Boolean,
     val lastActive: Long,
+    /** A Claude Code session running in a terminal on the computer, mirrored live. */
+    val terminal: Boolean = false,
 )
 
 private fun parseSessions(arr: JSONArray?): List<SessionRow> {
@@ -588,6 +596,7 @@ private fun parseSessions(arr: JSONArray?): List<SessionRow> {
             title = o.optString("title"),
             running = o.optString("state") == "running",
             lastActive = o.optLong("lastActive", 0L),
+            terminal = o.optString("origin") == "terminal",
         )
     }
 }
@@ -630,6 +639,7 @@ fun DeviceHome(
     suspend fun loadAccount() {
         try {
             val acc = parseAccount(client.request("account", JSONObject()))
+            // State writes are equals()-checked, so an unchanged poll result recomposes nothing.
             account = acc
             usage = if (acc.loggedIn) {
                 try {
@@ -651,8 +661,11 @@ fun DeviceHome(
 
     suspend fun loadSessions() {
         val reply = client.request("sessions", JSONObject())
-        open = parseSessions(reply.optJSONArray("open")).sortedByDescending { it.lastActive }
-        closed = parseSessions(reply.optJSONArray("closed")).sortedByDescending { it.lastActive }.take(CLOSED_SHOWN)
+        val newOpen = parseSessions(reply.optJSONArray("open")).sortedByDescending { it.lastActive }
+        val newClosed = parseSessions(reply.optJSONArray("closed")).sortedByDescending { it.lastActive }.take(CLOSED_SHOWN)
+        // Polled every 5 s and usually unchanged: keep the old list objects so nothing recomposes.
+        if (newOpen != open) open = newOpen
+        if (newClosed != closed) closed = newClosed
         loaded = true
     }
 
@@ -662,12 +675,20 @@ fun DeviceHome(
         loading = true
         error = null
         try {
-            val info = client.request("info", JSONObject())
-            val name = info.optString("name").trim()
-            // Only fill in a name the user hasn't chosen themselves.
-            if (name.isNotEmpty() && device.name.isBlank()) app.devices.rename(device.id, name)
-            loadAccount()
-            loadSessions()
+            // Sessions first: they are what the screen is for. Account and usage need the
+            // computer to run `claude auth status` (a second or two), so they load alongside
+            // and fill their cards in when ready instead of holding the list back.
+            coroutineScope {
+                launch { loadAccount() }
+                launch {
+                    val info = client.request("info", JSONObject())
+                    val name = info.optString("name").trim()
+                    // Only fill in a name the user hasn't chosen themselves.
+                    if (name.isNotEmpty() && device.name.isBlank()) app.devices.rename(device.id, name)
+                }
+                loadSessions()
+                loading = false
+            }
             authProblem = false
         } catch (e: CancellationException) {
             throw e
@@ -688,9 +709,10 @@ fun DeviceHome(
         }
     }
 
-    // Account and usage change slowly: refresh them once a minute while visible.
+    // Account and usage change slowly: refresh them once a minute while visible. Only while
+    // RESUMED, so nothing polls (radio, battery) once the app is in the background.
     LaunchedEffect(device.id, device.url) {
-        lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
+        lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
             while (true) {
                 delay(60_000)
                 if (!loading) loadAccount()
@@ -698,9 +720,9 @@ fun DeviceHome(
         }
     }
 
-    // Poll while visible so running states stay current.
+    // Poll while visible (RESUMED) so running states stay current.
     LaunchedEffect(device.id, device.url) {
-        lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
+        lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
             while (true) {
                 delay(5_000)
                 if (loading) continue
@@ -889,7 +911,7 @@ fun DeviceHome(
                         if (open.isEmpty()) item(key = "__openEmpty") {
                             EmptyRow(Icons.Default.Terminal, "No open sessions. Start one with New session.")
                         }
-                        items(open, key = { "o:" + (it.key ?: it.sessionId ?: it.cwd) }) { row ->
+                        items(open, key = { "o:" + (it.key ?: it.sessionId ?: it.cwd) }, contentType = { "session" }) { row ->
                             SessionItem(
                                 row = row,
                                 isOpen = true,
@@ -901,7 +923,7 @@ fun DeviceHome(
                         if (closed.isEmpty()) item(key = "__closedEmpty") {
                             EmptyRow(Icons.Default.History, "No saved sessions on this computer.")
                         }
-                        items(closed, key = { "c:" + (it.sessionId ?: (it.cwd + it.lastActive)) }) { row ->
+                        items(closed, key = { "c:" + (it.sessionId ?: (it.cwd + it.lastActive)) }, contentType = { "session" }) { row ->
                             SessionItem(row = row, isOpen = false, onClick = { resume(row) }, onClose = null)
                         }
                         item(key = "__bottom") { Spacer(Modifier.navigationBarsPadding().height(16.dp)) }
@@ -1108,7 +1130,20 @@ private fun SessionItem(row: SessionRow, isOpen: Boolean, onClick: () -> Unit, o
                     horizontalAlignment = Alignment.End,
                     verticalArrangement = Arrangement.spacedBy(4.dp),
                 ) {
-                    if (isOpen) {
+                    if (isOpen) Row(
+                        horizontalArrangement = Arrangement.spacedBy(4.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        if (row.terminal) {
+                            Text(
+                                "Terminal",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onTertiaryContainer,
+                                modifier = Modifier
+                                    .background(MaterialTheme.colorScheme.tertiaryContainer, MaterialTheme.shapes.extraSmall)
+                                    .padding(horizontal = 6.dp, vertical = 2.dp),
+                            )
+                        }
                         Text(
                             if (row.running) "Running" else "Idle",
                             style = MaterialTheme.typography.labelSmall,

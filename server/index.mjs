@@ -415,7 +415,14 @@ class Session {
           }
           break;
         case 'result': {
-          if (msg.subtype !== 'success') this.emit({ k: 'note', text: msg.result || `Turn ended: ${msg.subtype}` });
+          if (msg.subtype !== 'success') {
+            const why = this.interrupted ? 'Stopped'
+              : msg.subtype === 'error_max_turns' ? 'Stopped: reached the turn limit'
+              : msg.subtype === 'error_max_budget_usd' ? 'Stopped: reached the budget limit'
+              : msg.result || 'The turn ended with an error';
+            this.emit({ k: 'note', text: why });
+          }
+          this.interrupted = false;
           if (typeof msg.total_cost_usd === 'number') this.costUsd = msg.total_cost_usd;
           const u = msg.usage ?? {};
           const ctx = (u.input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0);
@@ -492,6 +499,7 @@ class Session {
   }
 
   interrupt() {
+    if (this.q && this.state === 'running') this.interrupted = true;
     this.q?.interrupt?.().catch(() => {});
   }
 

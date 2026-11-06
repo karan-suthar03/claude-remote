@@ -8,10 +8,12 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.Terminal
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -132,6 +134,12 @@ fun ChatScreen(app: App, device: Device, key: String, onBack: () -> Unit) {
         )
     }
 
+    // Read once here: the app bar lambdas then capture plain values and skip recomposition while
+    // a reply streams in (only items change then).
+    val title = state.title
+    val cwd = state.cwd
+    val closed = state.closed
+
     Scaffold(
         snackbarHost = { SnackbarHost(snackbar) },
         topBar = {
@@ -142,13 +150,13 @@ fun ChatScreen(app: App, device: Device, key: String, onBack: () -> Unit) {
                 title = {
                     Column {
                         Text(
-                            state.title.ifBlank { "New session" },
+                            title.ifBlank { "New session" },
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis,
                         )
-                        if (state.cwd.isNotEmpty()) {
+                        if (cwd.isNotEmpty()) {
                             Text(
-                                state.cwd,
+                                cwd,
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.outline,
                                 maxLines = 1,
@@ -173,7 +181,7 @@ fun ChatScreen(app: App, device: Device, key: String, onBack: () -> Unit) {
                             )
                             DropdownMenuItem(
                                 text = { Text("Close session") },
-                                enabled = !state.closed,
+                                enabled = !closed,
                                 onClick = {
                                     menuOpen = false
                                     session.close()
@@ -189,7 +197,13 @@ fun ChatScreen(app: App, device: Device, key: String, onBack: () -> Unit) {
         Column(Modifier.padding(padding).fillMaxSize().imePadding()) {
             if (!state.loading || state.model != null) {
                 SessionBar(
-                    state = state,
+                    model = state.model,
+                    effort = state.effort,
+                    closed = state.closed,
+                    costUsd = state.costUsd,
+                    contextTokens = state.contextTokens,
+                    background = state.background,
+                    terminal = state.isTerminal,
                     models = models,
                     busy = changing,
                     onModelClick = {
@@ -199,6 +213,9 @@ fun ChatScreen(app: App, device: Device, key: String, onBack: () -> Unit) {
                     onEffort = { changeModel(null, it) },
                 )
             }
+            // A terminal session mirrored live; the bridge switches origin to "bridge" (a meta
+            // event) once a message is sent from here, which hides this.
+            if (state.isTerminal && !state.closed) TerminalBanner()
             when {
                 state.closed -> Banner("This session has been closed.")
                 // Attached before but the socket is down: the client is reconnecting by itself.
@@ -224,9 +241,34 @@ fun ChatScreen(app: App, device: Device, key: String, onBack: () -> Unit) {
             }
             InputBar(
                 running = state.running,
-                onSend = session::send,
+                onSend = { text, images, onResult -> session.send(text, images, onResult) },
                 onStop = session::interrupt,
+                onMessage = { message -> scope.launch { snackbar.showSnackbar(message) } },
                 enabled = !state.closed,
+            )
+        }
+    }
+}
+
+/** Shown while the session is a terminal session on the computer, mirrored live. */
+@Composable
+private fun TerminalBanner() {
+    Surface(color = MaterialTheme.colorScheme.surfaceContainerHigh, modifier = Modifier.fillMaxWidth()) {
+        Row(
+            Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(
+                Icons.Default.Terminal,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.size(16.dp),
+            )
+            Text(
+                "Running in a terminal on this computer. You're watching it live; sending a message continues it here.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(start = 10.dp).weight(1f),
             )
         }
     }

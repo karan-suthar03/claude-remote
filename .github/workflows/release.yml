@@ -1,0 +1,73 @@
+# Builds the signed app and publishes it as a GitHub release when a version tag is pushed:
+#   git tag v1.0.0 && git push origin v1.0.0
+# The APK is attached as claude-remote.apk, so this link always gets the newest one:
+#   https://github.com/<owner>/<repo>/releases/latest/download/claude-remote.apk
+#
+# Signing (one time): add these repository secrets (Settings > Secrets and variables > Actions):
+#   ANDROID_KEYSTORE_BASE64  base64 of the release keystore (.jks)
+#   ANDROID_KEYSTORE_PASSWORD
+#   ANDROID_KEY_ALIAS        (optional, default "claude-remote")
+#   ANDROID_KEY_PASSWORD     (optional, defaults to the keystore password)
+# Without them the APK is signed with a throwaway debug key and can't update an earlier install.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Version from tag
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          if echo "$TAG" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            IFS=. read -r MA MI PA <<EOF
+          $TAG
+          EOF
+            echo "CR_VERSION_NAME=$TAG" >> "$GITHUB_ENV"
+            echo "CR_VERSION_CODE=$((MA * 10000 + MI * 100 + PA))" >> "$GITHUB_ENV"
+          fi
+
+      - name: Release key
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.jks"
+            echo "CR_KEYSTORE=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
+          else
+            echo "::warning::No ANDROID_KEYSTORE_BASE64 secret: signing with a debug key."
+          fi
+
+      - name: Build
+        working-directory: android
+        env:
+          CR_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          CR_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          CR_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon :app:assembleRelease
+          cp app/build/outputs/apk/release/app-release.apk "$RUNNER_TEMP/claude-remote.apk"
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ runner.temp }}/claude-remote.apk
+          generate_release_notes: true

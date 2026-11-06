@@ -1,6 +1,7 @@
 package me.karansuthar.clauderemote.data
 
 import android.content.Context
+import androidx.compose.runtime.Immutable
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import org.json.JSONArray
@@ -8,13 +9,15 @@ import org.json.JSONObject
 import java.util.UUID
 
 /** A computer running the bridge. [url] is its WebSocket address (ws://host:8000/ws). */
+@Immutable
 data class Device(val id: String, val url: String, val name: String) {
-    /** host:port, for display. */
-    val address: String
-        get() = runCatching {
+    /** host:port, for display. Parsed once: it is read on every drawer and top-bar recomposition. */
+    val address: String by lazy(LazyThreadSafetyMode.PUBLICATION) {
+        runCatching {
             val uri = java.net.URI(url)
             if (uri.port > 0) "${uri.host}:${uri.port}" else uri.host
         }.getOrNull() ?: url
+    }
 
     val displayName: String get() = name.ifBlank { address }
 }

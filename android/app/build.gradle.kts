@@ -13,8 +13,25 @@ android {
         // Android 8+: covers phones still on Android 11 (e.g. Oppo Reno 6 as shipped).
         minSdk = 26
         targetSdk = 36
-        versionCode = 1
-        versionName = "0.1"
+        // Release builds from CI set these from the git tag (v1.2.3 -> 1.2.3, code 10203).
+        versionCode = (System.getenv("CR_VERSION_CODE") ?: "1").toInt()
+        versionName = System.getenv("CR_VERSION_NAME") ?: "0.1"
+    }
+
+    // A real release key, when one is provided (CI secrets or ~/.gradle/gradle.properties), so
+    // every published APK can update the previous one. Without it, release builds use the
+    // local debug key: fine for your own builds, but they can't update an installed release.
+    val keystore = System.getenv("CR_KEYSTORE") ?: (findProperty("crKeystore") as String?)
+    signingConfigs {
+        if (keystore != null && file(keystore).exists()) {
+            create("release") {
+                storeFile = file(keystore)
+                storePassword = System.getenv("CR_KEYSTORE_PASSWORD") ?: findProperty("crKeystorePassword") as String?
+                keyAlias = System.getenv("CR_KEY_ALIAS") ?: (findProperty("crKeyAlias") as String?) ?: "claude-remote"
+                keyPassword = System.getenv("CR_KEY_PASSWORD") ?: (findProperty("crKeyPassword") as String?)
+                    ?: (System.getenv("CR_KEYSTORE_PASSWORD") ?: findProperty("crKeystorePassword") as String?)
+            }
+        }
     }
 
     buildTypes {
@@ -23,8 +40,7 @@ android {
             isMinifyEnabled = true
             isShrinkResources = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
-            // Sideloaded app: sign release with the debug key.
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = signingConfigs.findByName("release") ?: signingConfigs.getByName("debug")
         }
     }
     compileOptions {

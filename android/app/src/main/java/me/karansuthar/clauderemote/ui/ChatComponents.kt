@@ -68,9 +68,27 @@ import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.platform.LocalDensity
 import kotlinx.coroutines.launch
 import java.util.Locale
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.roundToInt
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.PickVisualMediaRequest
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.material.icons.filled.AttachFile
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.runtime.Immutable
+import androidx.compose.runtime.mutableStateListOf
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
+import kotlinx.coroutines.CancellationException
+import me.karansuthar.clauderemote.data.ChatImage
 import me.karansuthar.clauderemote.data.ChatItem
-import me.karansuthar.clauderemote.data.ChatState
 import me.karansuthar.clauderemote.data.ModelInfo
 import me.karansuthar.clauderemote.data.Step
 
@@ -141,6 +159,8 @@ fun MessageList(
             contentPadding = PaddingValues(12.dp),
         ) {
             // Items are only ever appended (a snapshot replaces the list), so the index is stable.
+            // ChatItem is @Immutable and only the last item changes while streaming, so every
+            // other row skips recomposition.
             itemsIndexed(items, key = { index, _ -> index }, contentType = { _, item -> item.role }) { index, item ->
                 MessageBubble(
                     item,
@@ -202,9 +222,15 @@ private fun MessageBubble(item: ChatItem, live: Boolean, running: Boolean, alway
                 shape = RoundedCornerShape(18.dp),
                 modifier = Modifier.widthIn(max = 320.dp),
             ) {
-                Column(Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
-                    val text = remember(item.text) { safeBackticks(item.text) }
-                    SelectionContainer { Text(text) }
+                Column {
+                    if (item.images.isNotEmpty()) MessageImages(item.images, Modifier.padding(4.dp))
+                    if (item.text.isNotEmpty() || item.images.isEmpty()) {
+                        val text = remember(item.text) { safeBackticks(item.text) }
+                        val top = if (item.images.isEmpty()) 10.dp else 4.dp
+                        SelectionContainer {
+                            Text(text, Modifier.padding(start = 14.dp, end = 14.dp, top = top, bottom = 10.dp))
+                        }
+                    }
                 }
             }
         }
@@ -222,7 +248,7 @@ private fun MessageBubble(item: ChatItem, live: Boolean, running: Boolean, alway
                 }
             }
             if (item.text.isNotBlank()) {
-                SelectionContainer { MarkdownText(item.text, Modifier.fillMaxWidth()) }
+                SelectionContainer { MarkdownText(item.text, Modifier.fillMaxWidth(), live = live) }
             }
         }
         else -> Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Center) {
@@ -231,9 +257,11 @@ private fun MessageBubble(item: ChatItem, live: Boolean, running: Boolean, alway
                 border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
                 color = MaterialTheme.colorScheme.surface,
             ) {
+                val base = MaterialTheme.typography.bodySmall
+                val noteStyle = remember(base) { base.copy(fontStyle = FontStyle.Italic) }
                 Text(
-                    safeBackticks(item.text),
-                    style = MaterialTheme.typography.bodySmall.copy(fontStyle = FontStyle.Italic),
+                    remember(item.text) { safeBackticks(item.text) },
+                    style = noteStyle,
                     color = MaterialTheme.colorScheme.outline,
                     textAlign = TextAlign.Center,
                     modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
@@ -246,7 +274,8 @@ private fun MessageBubble(item: ChatItem, live: Boolean, running: Boolean, alway
 @Composable
 private fun ThinkingBlock(thinking: String, stillThinking: Boolean) {
     var expanded by rememberSaveable { mutableStateOf(false) }
-    val style = MaterialTheme.typography.bodySmall.copy(fontStyle = FontStyle.Italic)
+    val base = MaterialTheme.typography.bodySmall
+    val style = remember(base) { base.copy(fontStyle = FontStyle.Italic) }
     val dim = MaterialTheme.colorScheme.outline
     Column(
         Modifier
@@ -268,13 +297,18 @@ private fun ThinkingBlock(thinking: String, stillThinking: Boolean) {
                 modifier = Modifier.size(16.dp),
             )
         }
-        // While thinking, show the latest line; afterwards collapse unless opened.
-        val shown = when {
-            expanded -> thinking
-            stillThinking -> thinking.trim().lines().lastOrNull { it.isNotBlank() }.orEmpty()
-            else -> ""
+        // While thinking, show the latest line; afterwards collapse unless opened. Cached: the
+        // thinking text can be long and this would otherwise split it on every streamed delta.
+        val shown = remember(thinking, expanded, stillThinking) {
+            safeBackticks(
+                when {
+                    expanded -> thinking
+                    stillThinking -> thinking.trim().lines().lastOrNull { it.isNotBlank() }.orEmpty()
+                    else -> ""
+                },
+            )
         }
-        if (shown.isNotEmpty()) Text(safeBackticks(shown), style = style, color = dim)
+        if (shown.isNotEmpty()) Text(shown, style = style, color = dim)
     }
 }
 
@@ -297,36 +331,174 @@ fun ConfirmCard(question: String, onAnswer: (Boolean) -> Unit, modifier: Modifie
     }
 }
 
-/** Text input with Send; while Claude Code is running, a Stop button sits beside it. */
+/** An image picked in the input bar: [image] and [thumb] are null while it is being prepared. */
+@Immutable
+private class PendingImage(val id: Long, val image: ChatImage? = null, val thumb: ImageBitmap? = null)
+
+private val pendingIds = AtomicLong()
+
+/** Most images in one message, and most base64 in one send (the socket queue holds 16 MB). */
+private const val MAX_IMAGES = 10
+private const val MAX_SEND_CHARS = 12_000_000L
+
+/**
+ * Text input with an attach button and Send; while Claude Code is running, a Stop button sits
+ * beside it. Picked images show as thumbnails above the field until they are sent. [onSend] gets
+ * the text, the images and a callback for whether the send went through. [onMessage] shows a
+ * short notice (a snackbar).
+ */
 @Composable
 fun InputBar(
     running: Boolean,
-    onSend: (String) -> Unit,
+    onSend: (text: String, images: List<ChatImage>, onResult: (Boolean) -> Unit) -> Unit,
     onStop: () -> Unit,
+    onMessage: (String) -> Unit,
     modifier: Modifier = Modifier,
     enabled: Boolean = true,
 ) {
     var text by rememberSaveable { mutableStateOf("") }
-    Row(modifier.padding(horizontal = 12.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-        OutlinedTextField(
-            value = text,
-            onValueChange = { text = it },
-            placeholder = { Text(if (enabled) "Message Claude Code" else "Session closed") },
-            modifier = Modifier.weight(1f),
-            enabled = enabled,
-            maxLines = 6,
-            shape = RoundedCornerShape(24.dp),
-        )
-        if (running && enabled) {
-            IconButton(onClick = onStop) { Icon(Icons.Default.Stop, "Stop") }
+    val pending = remember { mutableStateListOf<PendingImage>() }
+    var sending by remember { mutableStateOf(false) }
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+
+    val picker = rememberLauncherForActivityResult(
+        ActivityResultContracts.PickMultipleVisualMedia(maxItems = MAX_IMAGES),
+    ) { uris ->
+        val room = MAX_IMAGES - pending.size
+        if (uris.size > room) onMessage("Up to $MAX_IMAGES images per message")
+        for (uri in uris.take(room.coerceAtLeast(0))) {
+            val id = pendingIds.incrementAndGet()
+            pending += PendingImage(id)
+            scope.launch {
+                val prepared = try {
+                    prepareImage(context.applicationContext, uri)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Throwable) {
+                    null
+                }
+                val index = pending.indexOfFirst { it.id == id }
+                if (index < 0) return@launch // removed while it was being prepared
+                if (prepared == null) {
+                    pending.removeAt(index)
+                    onMessage("Couldn't read that image")
+                } else {
+                    pending[index] = PendingImage(id, prepared.image, prepared.thumb)
+                }
+            }
         }
-        IconButton(
-            onClick = {
-                onSend(text)
-                text = ""
-            },
-            enabled = enabled && text.isNotBlank(),
-        ) { Icon(Icons.AutoMirrored.Filled.Send, "Send") }
+    }
+
+    val preparing = pending.any { it.image == null }
+    val canSend = enabled && !sending && !preparing && (text.isNotBlank() || pending.isNotEmpty())
+
+    Column(modifier) {
+        if (pending.isNotEmpty()) {
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState())
+                    .padding(start = 12.dp, end = 12.dp, top = 8.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                for (p in pending) {
+                    key(p.id) {
+                        PendingThumb(p, removable = !sending) { pending.removeAll { it.id == p.id } }
+                    }
+                }
+            }
+        }
+        Row(Modifier.padding(start = 4.dp, end = 12.dp, top = 8.dp, bottom = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+            IconButton(
+                onClick = {
+                    try {
+                        picker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+                    } catch (e: Exception) {
+                        onMessage("No app to pick images with")
+                    }
+                },
+                enabled = enabled && !sending && pending.size < MAX_IMAGES,
+            ) { Icon(Icons.Default.AttachFile, "Attach images") }
+            OutlinedTextField(
+                value = text,
+                onValueChange = { text = it },
+                placeholder = { Text(if (enabled) "Message Claude Code" else "Session closed") },
+                modifier = Modifier.weight(1f),
+                enabled = enabled,
+                maxLines = 6,
+                shape = RoundedCornerShape(24.dp),
+            )
+            if (running && enabled) {
+                IconButton(onClick = onStop) { Icon(Icons.Default.Stop, "Stop") }
+            }
+            if (sending) {
+                Box(Modifier.size(48.dp), contentAlignment = Alignment.Center) {
+                    CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
+                }
+            } else {
+                IconButton(
+                    onClick = {
+                        val images = pending.mapNotNull { it.image }
+                        if (images.sumOf { it.data.length.toLong() } > MAX_SEND_CHARS) {
+                            onMessage("These images are too large to send together. Remove some.")
+                        } else {
+                            val sentText = text
+                            val sentIds = pending.map { it.id }.toSet()
+                            text = ""
+                            if (images.isNotEmpty()) sending = true
+                            onSend(sentText, images) { ok ->
+                                sending = false
+                                if (ok) {
+                                    pending.removeAll { it.id in sentIds }
+                                } else {
+                                    if (text.isEmpty()) text = sentText
+                                    if (images.isNotEmpty()) onMessage("Couldn't send. Your images are still attached.")
+                                }
+                            }
+                        }
+                    },
+                    enabled = canSend,
+                ) { Icon(Icons.AutoMirrored.Filled.Send, "Send") }
+            }
+        }
+    }
+}
+
+/** A 56dp thumbnail of a picked image with an × to remove it; a spinner while it is prepared. */
+@Composable
+private fun PendingThumb(p: PendingImage, removable: Boolean, onRemove: () -> Unit) {
+    val cs = MaterialTheme.colorScheme
+    Box(Modifier.size(56.dp)) {
+        Box(
+            Modifier
+                .fillMaxSize()
+                .clip(RoundedCornerShape(10.dp))
+                .background(cs.surfaceVariant),
+            contentAlignment = Alignment.Center,
+        ) {
+            val thumb = p.thumb
+            if (thumb != null) {
+                Image(thumb, contentDescription = "Attached image", contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize())
+            } else {
+                CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
+            }
+        }
+        if (removable) {
+            Surface(
+                shape = CircleShape,
+                color = cs.inverseSurface.copy(alpha = 0.85f),
+                contentColor = cs.inverseOnSurface,
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .padding(2.dp)
+                    .size(20.dp)
+                    .clip(CircleShape)
+                    .clickable(onClickLabel = "Remove image", onClick = onRemove),
+            ) {
+                Icon(Icons.Default.Close, contentDescription = "Remove image", modifier = Modifier.padding(3.dp))
+            }
+        }
     }
 }
 
@@ -339,18 +511,26 @@ fun formatTokens(n: Int): String = when {
 
 /**
  * A slim bar under the app bar: the session's model and effort (each opens a picker) and its
- * cost, context size and background tasks. [models] is null until fetched.
+ * cost, context size and background tasks. [models] is null until fetched. Takes plain fields
+ * rather than the whole ChatState so it skips recomposition while a reply streams in.
+ * [terminal]: a mirrored terminal session, whose model isn't known until it is continued here.
  */
 @Composable
 fun SessionBar(
-    state: ChatState,
+    model: String?,
+    effort: String?,
+    closed: Boolean,
+    costUsd: Double,
+    contextTokens: Int,
+    background: Int,
+    terminal: Boolean,
     models: List<ModelInfo>?,
     busy: Boolean,
     onModelClick: () -> Unit,
     onEffort: (String) -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    val current = models?.find { it.value == state.model }
+    val current = remember(models, model) { models?.find { it.value == model } }
     val efforts = current?.efforts.orEmpty()
     var effortOpen by remember { mutableStateOf(false) }
     Row(
@@ -358,28 +538,28 @@ fun SessionBar(
         verticalAlignment = Alignment.CenterVertically,
     ) {
         BarChip(
-            label = current?.displayName ?: state.model ?: "Default model",
-            enabled = !busy && !state.closed,
+            label = current?.displayName ?: model ?: if (terminal) "\u2014" else "Default model",
+            enabled = !busy && !closed,
             onClick = onModelClick,
         )
         if (efforts.isNotEmpty()) {
             Spacer(Modifier.size(6.dp))
             Box {
                 BarChip(
-                    label = state.effort ?: "Effort",
-                    enabled = !busy && !state.closed,
+                    label = effort ?: "Effort",
+                    enabled = !busy && !closed,
                     onClick = { effortOpen = true },
                 )
                 DropdownMenu(expanded = effortOpen, onDismissRequest = { effortOpen = false }) {
-                    efforts.forEach { effort ->
+                    efforts.forEach { option ->
                         DropdownMenuItem(
-                            text = { Text(effort) },
+                            text = { Text(option) },
                             trailingIcon = {
-                                if (effort == state.effort) Icon(Icons.Default.Check, "Current")
+                                if (option == effort) Icon(Icons.Default.Check, "Current")
                             },
                             onClick = {
                                 effortOpen = false
-                                if (effort != state.effort) onEffort(effort)
+                                if (option != effort) onEffort(option)
                             },
                         )
                     }
@@ -391,17 +571,18 @@ fun SessionBar(
             CircularProgressIndicator(Modifier.size(12.dp), strokeWidth = 1.5.dp)
         }
         Spacer(Modifier.weight(1f))
-        val stats = "$" + String.format(Locale.US, "%.2f", state.costUsd) + " · " +
-            formatTokens(state.contextTokens) + " ctx"
+        val stats = remember(costUsd, contextTokens) {
+            "$" + String.format(Locale.US, "%.2f", costUsd) + " · " + formatTokens(contextTokens) + " ctx"
+        }
         Text(
             stats,
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.outline,
             maxLines = 1,
         )
-        if (state.background > 0) {
+        if (background > 0) {
             Text(
-                " · ${state.background} bg",
+                " · $background bg",
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.outline,
                 maxLines = 1,

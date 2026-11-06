@@ -24,3 +24,8 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Signing keys never go in the repo
+*.jks
+*.keystore
+bridge.log

@@ -1,9 +1,13 @@
 package me.karansuthar.clauderemote.data
 
+import androidx.compose.runtime.Immutable
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
@@ -12,10 +16,51 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 /**
+ * An image in a message or a tool result: [data] is base64 (no data: prefix) of [mediaType]
+ * (image/jpeg, png, gif or webp). Kept encoded; the UI decodes it only when it is shown.
+ */
+@Immutable
+data class ChatImage(val mediaType: String, val data: String) {
+    /** A cheap content key (length plus a hash of samples), for caching decoded bitmaps. */
+    val cacheKey: String get() = imageKey(data)
+
+    // The default would print megabytes of base64.
+    override fun toString() = "ChatImage($mediaType, ${data.length} chars)"
+}
+
+private fun imageKey(data: String): String {
+    val n = data.length
+    var h = n.toLong()
+    fun mix(from: Int, to: Int) {
+        for (i in from until to) h = h * 31 + data[i].code
+    }
+    if (n <= 12_288) {
+        mix(0, n)
+    } else {
+        mix(0, 4_096)
+        val mid = n / 2 - 2_048
+        mix(mid, mid + 4_096)
+        mix(n - 4_096, n)
+    }
+    return n.toString() + ":" + java.lang.Long.toHexString(h)
+}
+
+/** Parses `images: [{mediaType, data}]`; anything malformed is skipped. */
+fun parseImages(arr: JSONArray?): List<ChatImage> {
+    if (arr == null || arr.length() == 0) return emptyList()
+    return (0 until arr.length()).mapNotNull { i ->
+        val o = arr.optJSONObject(i) ?: return@mapNotNull null
+        val data = o.stringOrNull("data")?.takeIf { it.isNotEmpty() } ?: return@mapNotNull null
+        ChatImage(o.stringOrNull("mediaType")?.takeIf { it.isNotEmpty() } ?: "image/png", data)
+    }
+}
+
+/**
  * One tool call in an assistant reply. [name] is the tool (Bash, Edit, mcp__…); [detail] is the
  * whole call (command, diff, file content, JSON or prompt) in [detailLang] ("bash", "diff",
  * "json", a file extension or ""); [output] is the tool's result, "" until [done].
  */
+@Immutable
 data class Step(
     val id: String,
     val label: String,
@@ -26,16 +71,25 @@ data class Step(
     val detail: String = "",
     val detailLang: String = "",
     val output: String = "",
+    /** Images in the tool's result (e.g. Read on a PNG). */
+    val images: List<ChatImage> = emptyList(),
 )
 
-/** A chat line: role is "user", "assistant" or "note". */
+/**
+ * A chat line: role is "user", "assistant" or "note". These classes are never mutated (every change
+ * is a copy), so @Immutable lets Compose skip unchanged chat rows by equals() while a reply streams.
+ */
+@Immutable
 data class ChatItem(
     val role: String,
     val text: String = "",
     val thinking: String = "",
     val steps: List<Step> = emptyList(),
+    /** Images attached to a user message. */
+    val images: List<ChatImage> = emptyList(),
 )
 
+@Immutable
 data class ChatState(
     val items: List<ChatItem> = emptyList(),
     /** "running" or "idle". */
@@ -54,11 +108,18 @@ data class ChatState(
     val contextTokens: Int = 0,
     /** Background tasks running right now. */
     val background: Int = 0,
+    /** "bridge", or "terminal": a Claude Code session running in a terminal on the computer, mirrored live. */
+    val origin: String = ORIGIN_BRIDGE,
 ) {
     val running: Boolean get() = state == "running"
+    val isTerminal: Boolean get() = origin == ORIGIN_TERMINAL
 }
 
+const val ORIGIN_BRIDGE = "bridge"
+const val ORIGIN_TERMINAL = "terminal"
+
 /** A session as listed by the bridge. [key] is set only for open sessions. */
+@Immutable
 data class SessionInfo(
     val key: String?,
     val sessionId: String?,
@@ -71,6 +132,8 @@ data class SessionInfo(
     val costUsd: Double = 0.0,
     val contextTokens: Int = 0,
     val background: Int = 0,
+    /** "bridge" or "terminal" (see [ChatState.origin]). */
+    val origin: String = ORIGIN_BRIDGE,
 ) {
     val running: Boolean get() = state == "running"
 }
@@ -91,9 +154,11 @@ fun parseSession(o: JSONObject) = SessionInfo(
     costUsd = o.optDouble("costUsd", 0.0).takeIf { !it.isNaN() } ?: 0.0,
     contextTokens = o.optInt("contextTokens"),
     background = o.optInt("background"),
+    origin = o.stringOrNull("origin")?.takeIf { it.isNotEmpty() } ?: ORIGIN_BRIDGE,
 )
 
 /** A model the bridge offers: [value] is what set_model takes; [efforts] may be empty. */
+@Immutable
 data class ModelInfo(
     val value: String,
     val displayName: String,
@@ -128,6 +193,7 @@ fun ChatState.withSession(s: SessionInfo) = copy(
     costUsd = s.costUsd,
     contextTokens = s.contextTokens,
     background = s.background,
+    origin = s.origin,
 )
 
 fun parseSessions(arr: JSONArray?): List<SessionInfo> =
@@ -143,6 +209,7 @@ private fun parseStep(o: JSONObject) = Step(
     detail = o.stringOrNull("detail").orEmpty(),
     detailLang = o.stringOrNull("detailLang").orEmpty(),
     output = o.stringOrNull("output").orEmpty(),
+    images = parseImages(o.optJSONArray("images")),
 )
 
 fun parseItem(o: JSONObject): ChatItem {
@@ -152,6 +219,7 @@ fun parseItem(o: JSONObject): ChatItem {
         text = o.stringOrNull("text").orEmpty(),
         thinking = o.stringOrNull("thinking").orEmpty(),
         steps = if (steps == null) emptyList() else (0 until steps.length()).mapNotNull { steps.optJSONObject(it)?.let(::parseStep) },
+        images = parseImages(o.optJSONArray("images")),
     )
 }
 
@@ -179,21 +247,28 @@ fun ChatState.reduce(e: JSONObject): ChatState = when (e.optString("k")) {
     else -> copy(items = applyEvent(items, e))
 }
 
+/** A copy with the last element replaced: one array copy (dropLast + plus made two per text delta). */
+private fun <T> List<T>.withLast(value: T): List<T> {
+    val out = ArrayList<T>(this)
+    out[out.lastIndex] = value
+    return out
+}
+
 private fun applyEvent(items: List<ChatItem>, e: JSONObject): List<ChatItem> {
     val last = items.lastOrNull()
     // Changes the last item if it is an assistant reply, otherwise starts a new one.
     fun withAssistant(change: (ChatItem) -> ChatItem): List<ChatItem> =
-        if (last?.role == "assistant") items.dropLast(1) + change(last)
+        if (last?.role == "assistant") items.withLast(change(last))
         else items + change(ChatItem("assistant"))
 
     val text = e.stringOrNull("text").orEmpty()
     return when (e.optString("k")) {
-        "user" -> items + ChatItem("user", text)
+        "user" -> items + ChatItem("user", text, images = parseImages(e.optJSONArray("images")))
         "text" -> withAssistant { it.copy(text = it.text + text) }
         "thinking" -> withAssistant { it.copy(thinking = it.thinking + text) }
         "sep" ->
             if (last?.role == "assistant" && last.text.isNotEmpty() && !last.text.endsWith("\n\n"))
-                items.dropLast(1) + last.copy(text = last.text + "\n\n")
+                items.withLast(last.copy(text = last.text + "\n\n"))
             else items
         "step" -> withAssistant {
             it.copy(
@@ -211,12 +286,13 @@ private fun applyEvent(items: List<ChatItem>, e: JSONObject): List<ChatItem> {
             val id = e.stringOrNull("id")
             val error = e.optBoolean("error")
             val output = e.stringOrNull("output").orEmpty()
+            val images = parseImages(e.optJSONArray("images"))
             val index = items.indexOfLast { item -> item.steps.any { it.id == id } }
             if (index < 0) items
             else items.toMutableList().also { list ->
                 val item = list[index]
                 list[index] = item.copy(
-                    steps = item.steps.map { if (it.id == id) it.copy(done = true, error = error, output = output) else it },
+                    steps = item.steps.map { if (it.id == id) it.copy(done = true, error = error, output = output, images = images) else it },
                 )
             }
         }
@@ -240,8 +316,32 @@ class ChatSession(
     private val _state = MutableStateFlow(ChatState())
     val state: StateFlow<ChatState> = _state
 
+    /** The up-to-date state (main thread only); [state] may lag it by up to [STREAM_PUBLISH_MS]. */
+    private var current = ChatState()
+    private var publishJob: Job? = null
+
+    /** Applies [change] and publishes it at once (user actions, attach, errors). */
     private fun update(change: (ChatState) -> ChatState) {
-        _state.value = change(_state.value)
+        current = change(current)
+        publishJob?.cancel()
+        publishJob = null
+        _state.value = current
+    }
+
+    /**
+     * Applies a streamed event now (so events keep their exact order relative to snapshots) but
+     * publishes at most once per [STREAM_PUBLISH_MS]. Text deltas can arrive 100+ times a second;
+     * without this every one of them would recompose the chat screen.
+     */
+    private fun updateStreamed(change: (ChatState) -> ChatState) {
+        current = change(current)
+        if (publishJob == null) {
+            publishJob = scope.launch {
+                delay(STREAM_PUBLISH_MS)
+                publishJob = null
+                _state.value = current
+            }
+        }
     }
 
     /** Attaches and replaces all state with the bridge's snapshot. */
@@ -255,7 +355,7 @@ class ChatSession(
             try {
                 // Resumes on Main before any later event is posted there, so events apply on top.
                 val reply = client.attach(key, this@ChatSession)
-                val error = if (keepError) _state.value.error else null
+                val error = if (keepError) current.error else null
                 update { snapshotState(reply).copy(error = error) }
             } catch (e: Exception) {
                 update { it.copy(loading = false, error = e.message ?: "Couldn't open the session") }
@@ -263,23 +363,38 @@ class ChatSession(
         }
     }
 
-    fun send(text: String) {
+    /**
+     * Sends a message with optional [images] (text may then be empty). [onResult] is called on the
+     * main thread with whether the bridge accepted it (not called if there was nothing to send).
+     */
+    fun send(text: String, images: List<ChatImage> = emptyList(), onResult: (Boolean) -> Unit = {}) {
         val body = text.trim()
-        if (body.isEmpty()) return
+        if (body.isEmpty() && images.isEmpty()) return
         scope.launch {
-            try {
-                client.request(
-                    "send",
-                    JSONObject()
-                        .put("key", key)
-                        .put("text", body),
-                )
+            val ok = try {
+                val fields = JSONObject()
+                    .put("key", key)
+                    .put("text", body)
+                if (images.isEmpty()) {
+                    client.request("send", fields)
+                } else {
+                    val arr = JSONArray()
+                    for (image in images) arr.put(JSONObject().put("mediaType", image.mediaType).put("data", image.data))
+                    fields.put("images", arr)
+                    // Megabytes of base64: serialised off the main thread, with time to upload.
+                    client.request("send", fields, timeoutMs = SEND_IMAGES_TIMEOUT_MS, heavy = true)
+                }
                 update { it.copy(error = null) }
+                true
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
                 update { it.copy(error = e.message ?: "Couldn't send") }
                 // Don't trust what the phone has after a failure: fetch a fresh snapshot.
-                if (!_state.value.closed) reattach()
+                if (!current.closed) reattach()
+                false
             }
+            onResult(ok)
         }
     }
 
@@ -314,9 +429,10 @@ class ChatSession(
 
     fun clearError() = update { it.copy(error = null) }
 
-    // Socket reader thread -> main thread.
+    // Socket reader thread -> main thread. Each frame is still posted on its own (cheap) so the
+    // main thread applies frames in arrival order; only publishing to the UI is coalesced.
     override fun onEvent(e: JSONObject) {
-        scope.launch { update { it.reduce(e) } }
+        scope.launch { updateStreamed { it.reduce(e) } }
     }
 
     override fun onClosed() {
@@ -324,6 +440,15 @@ class ChatSession(
     }
 
     override fun onSnapshot(reply: JSONObject) {
-        scope.launch { update { snapshotState(reply) } }
+        // A snapshot can hold a long history: build it here on the socket's reader thread and only
+        // swap it in on the main thread (posting at this point keeps the frame order).
+        val snapshot = snapshotState(reply)
+        scope.launch { update { snapshot } }
+    }
+
+    private companion object {
+        /** About two frames: smooth streaming text, at most ~30 UI updates a second. */
+        const val STREAM_PUBLISH_MS = 32L
+        const val SEND_IMAGES_TIMEOUT_MS = 120_000L
     }
 }

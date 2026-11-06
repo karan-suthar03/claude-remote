@@ -35,11 +35,14 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.Immutable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -72,7 +75,10 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.em
 import androidx.compose.ui.unit.sp
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.conflate
+import kotlinx.coroutines.withContext
 import java.util.Locale
 
 // ---------------------------------------------------------------------------------------------
@@ -82,15 +88,43 @@ import java.util.Locale
 /**
  * Renders [markdown] (CommonMark-ish plus GitHub tables, task lists and strikethrough). Partial
  * text from a stream renders sensibly: an unclosed code fence is an open code block and unclosed
- * emphasis stays literal. Wrap in a SelectionContainer to make it selectable.
+ * emphasis stays literal. Wrap in a SelectionContainer to make it selectable. [live]: the text is
+ * still streaming in, so it is re-parsed at most every [LIVE_PARSE_MS], off the main thread.
  */
 @Composable
-fun MarkdownText(markdown: String, modifier: Modifier = Modifier) {
-    val blocks = remember(markdown) { parseMarkdown(markdown) }
+fun MarkdownText(markdown: String, modifier: Modifier = Modifier, live: Boolean = false) {
+    val blocks = if (live) rememberLiveBlocks(markdown) else remember(markdown) { parseMarkdown(markdown) }
     val style = rememberMdStyle()
     Column(modifier, verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        // Blocks are @Immutable data classes, so unchanged blocks of a re-parse skip recomposition.
         for (block in blocks) MdBlockView(block, style)
     }
+}
+
+/** How often a streaming reply is re-parsed at most. */
+private const val LIVE_PARSE_MS = 80L
+
+/**
+ * Blocks for a reply that is still streaming. Re-parsing the whole reply on every delta (dozens a
+ * second) on the main thread is the main source of jank on long replies, so: parse on
+ * Dispatchers.Default, conflate updates that arrive meanwhile, and wait [LIVE_PARSE_MS] between
+ * parses. Only the first parse (on entering composition) is synchronous, to avoid a blank frame.
+ */
+@Composable
+private fun rememberLiveBlocks(markdown: String): List<MdBlock> {
+    val latest = rememberUpdatedState(markdown)
+    val blocks = remember { mutableStateOf(parseMarkdown(markdown)) }
+    LaunchedEffect(Unit) {
+        var parsed = markdown
+        snapshotFlow { latest.value }.conflate().collect { text ->
+            if (text != parsed) {
+                blocks.value = withContext(Dispatchers.Default) { parseMarkdown(text) }
+                parsed = text
+                delay(LIVE_PARSE_MS)
+            }
+        }
+    }
+    return blocks.value
 }
 
 /** Plain text for the system font: a raw backtick (U+0060) is drawn as a combining accent on some phones. */
@@ -116,9 +150,11 @@ fun CodeBlock(
     val colors = rememberSyntaxColors()
     val lang = remember(language) { language.trim().lowercase(Locale.ROOT) }
     val shown = remember(code) { prepareCode(code) }
-    val highlighted = remember(shown, lang, colors) { highlightCode(shown, lang, colors) }
+    val highlighted = rememberHighlighted(shown, lang, colors)
     val lineKinds = remember(shown, lang) { if (isDiffLang(lang)) diffLineKinds(shown) else null }
     val cs = MaterialTheme.colorScheme
+    val labelBase = MaterialTheme.typography.labelSmall
+    val labelStyle = remember(labelBase) { labelBase.copy(fontFamily = FontFamily.Monospace) }
     val container = if (isError) cs.errorContainer.copy(alpha = 0.5f) else cs.surfaceVariant.copy(alpha = 0.7f)
     Surface(color = container, shape = RoundedCornerShape(10.dp), modifier = modifier.fillMaxWidth()) {
         Column {
@@ -128,7 +164,7 @@ fun CodeBlock(
             ) {
                 Text(
                     label ?: lang.ifEmpty { "text" },
-                    style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
+                    style = labelStyle,
                     color = if (isError) cs.error else cs.outline,
                     maxLines = 1,
                     modifier = Modifier.weight(1f),
@@ -170,6 +206,35 @@ fun CodeBlock(
 
 private const val SAFE_BACKTICK = '\u02CB'
 
+/** Code at least this long is highlighted on Dispatchers.Default instead of during composition. */
+private const val ASYNC_HIGHLIGHT_CHARS = 3_000
+
+/**
+ * Syntax colouring for [code]. Short code is coloured inline (cheap, no flash of plain text);
+ * long code (up to [MAX_CODE_CHARS]) runs the regexes off the main thread. While a block streams in
+ * (the text only grows), the previous pass's colours are kept for the unchanged prefix so the
+ * colouring doesn't flicker between passes.
+ */
+@Composable
+private fun rememberHighlighted(code: String, lang: String, colors: SyntaxColors): AnnotatedString {
+    if (code.length < ASYNC_HIGHLIGHT_CHARS) {
+        return remember(code, lang, colors) { highlightCode(code, lang, colors) }
+    }
+    val result = remember { mutableStateOf<AnnotatedString?>(null) }
+    LaunchedEffect(code, lang, colors) {
+        result.value = withContext(Dispatchers.Default) { highlightCode(code, lang, colors) }
+    }
+    val done = result.value
+    return remember(code, done) {
+        when {
+            done == null -> AnnotatedString(code)
+            done.text == code -> done
+            code.startsWith(done.text) -> AnnotatedString(code, done.spanStyles)
+            else -> AnnotatedString(code)
+        }
+    }
+}
+
 @Composable
 private fun CodeText(text: AnnotatedString, lineKinds: ByteArray?, colors: SyntaxColors, modifier: Modifier) {
     var layout by remember { mutableStateOf<TextLayoutResult?>(null) }
@@ -188,10 +253,12 @@ private fun CodeText(text: AnnotatedString, lineKinds: ByteArray?, colors: Synta
             drawRect(color, topLeft = Offset(-extra, top), size = Size(size.width + 2 * extra, l.getLineBottom(i) - top))
         }
     }
+    val base = MaterialTheme.typography.bodySmall
+    val codeStyle = remember(base) { base.copy(fontFamily = FontFamily.Monospace, lineHeight = 18.sp) }
     SelectionContainer {
         Text(
             text,
-            style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace, lineHeight = 18.sp),
+            style = codeStyle,
             softWrap = false,
             onTextLayout = { layout = it },
             modifier = modifier.padding(horizontal = 12.dp, vertical = 8.dp).then(drawLines),
@@ -238,6 +305,7 @@ private fun prepareCode(code: String): String {
     return s
 }
 
+@Immutable
 private class SyntaxColors(
     val keyword: Color,
     val string: Color,
@@ -424,17 +492,27 @@ private fun highlightCode(code: String, lang: String, c: SyntaxColors): Annotate
 // Block model and parser
 // ---------------------------------------------------------------------------------------------
 
+// @Immutable: a streaming reply is re-parsed into new instances; equals() lets every unchanged
+// block skip recomposition instead of being compared by identity.
+@Immutable
 internal sealed interface MdBlock {
+    @Immutable
     data class Heading(val level: Int, val text: String) : MdBlock
+    @Immutable
     data class Paragraph(val text: String) : MdBlock
+    @Immutable
     data class Code(val lang: String, val code: String, val indent: Int) : MdBlock
+    @Immutable
     data class ListBlock(val items: List<MdListItem>) : MdBlock
+    @Immutable
     data class Quote(val blocks: List<MdBlock>) : MdBlock
     data object Rule : MdBlock
     /** [align] per column: -1 left/none, 0 centre, 1 right. Rows have exactly header.size cells. */
+    @Immutable
     data class Table(val header: List<String>, val align: List<Int>, val rows: List<List<String>>) : MdBlock
 }
 
+@Immutable
 internal data class MdListItem(
     val level: Int,
     val marker: String,
@@ -714,6 +792,7 @@ private fun splitRow(line: String): List<String> {
 // Inline parser
 // ---------------------------------------------------------------------------------------------
 
+@Immutable
 internal class InlineStyle(
     val code: SpanStyle,
     val link: TextLinkStyles,
@@ -725,6 +804,8 @@ private val BOLD = SpanStyle(fontWeight = FontWeight.Bold)
 private val BOLD_ITALIC = SpanStyle(fontWeight = FontWeight.Bold, fontStyle = FontStyle.Italic)
 private val STRIKE = SpanStyle(textDecoration = TextDecoration.LineThrough)
 private const val ESCAPABLE = "\\`*_{}[]()#+-.!|~<>\"'"
+/** "🖼 " between no-break spaces, so a Markdown image's chip keeps its icon and label together. */
+private const val IMAGE_CHIP = "\u00A0\uD83D\uDDBC\uFE0F\u00A0"
 private val SCHEME = Regex("""^[a-zA-Z][a-zA-Z0-9+.-]*:.+""")
 
 internal fun inlineMarkdown(text: String, st: InlineStyle): AnnotatedString {
@@ -919,8 +1000,13 @@ private fun appendInline(b: AnnotatedString.Builder, s: String, st: InlineStyle,
                     i++
                 } else {
                     val label = s.substring(m.labelStart, m.labelEnd)
-                    b.appendLinked(m.url, st) {
-                        if (image) append(label.ifBlank { "image" }) else appendInline(this, label, st, allowLinks = false)
+                    if (image) {
+                        // No network image loading: a chip-like link that opens the image's URL.
+                        b.appendLinked(m.url, st) {
+                            withStyle(st.code) { append(IMAGE_CHIP + safeBackticks(label.ifBlank { "image" }) + "\u00A0") }
+                        }
+                    } else {
+                        b.appendLinked(m.url, st) { appendInline(this, label, st, allowLinks = false) }
                     }
                     i = m.end
                 }
@@ -959,6 +1045,7 @@ private fun appendInline(b: AnnotatedString.Builder, s: String, st: InlineStyle,
 // Block rendering
 // ---------------------------------------------------------------------------------------------
 
+@Immutable
 private class MdStyle(
     val inline: InlineStyle,
     val ruleColor: Color,
@@ -1017,7 +1104,7 @@ private fun headingStyle(level: Int): TextStyle {
         3 -> t.titleMedium
         else -> t.titleSmall
     }
-    return base.copy(fontWeight = FontWeight.SemiBold)
+    return remember(base) { base.copy(fontWeight = FontWeight.SemiBold) }
 }
 
 @Composable
@@ -1117,6 +1204,7 @@ private fun MdTable(block: MdBlock.Table, style: MdStyle) {
     val rows = block.rows.size + 1
     val shape = RoundedCornerShape(8.dp)
     val textStyle = MaterialTheme.typography.bodyMedium
+    val headerStyle = remember(textStyle) { textStyle.copy(fontWeight = FontWeight.Bold) }
     Box(
         Modifier
             .horizontalScroll(rememberScrollState())
@@ -1139,7 +1227,7 @@ private fun MdTable(block: MdBlock.Table, style: MdStyle) {
                 ) {
                     Text(
                         cells[index],
-                        style = if (header) textStyle.copy(fontWeight = FontWeight.Bold) else textStyle,
+                        style = if (header) headerStyle else textStyle,
                         textAlign = align,
                         modifier = Modifier.fillMaxWidth(),
                     )

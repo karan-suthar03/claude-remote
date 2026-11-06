@@ -145,7 +145,7 @@ class MainActivity : ComponentActivity() {
                         onOpenSession = { key -> screen = Screen.Chat(key) },
                     )
                     Screen.Picker -> FolderPicker(
-                        client = app.client(current),
+                        client = remember(current) { app.client(current) },
                         onBack = { screen = Screen.Device },
                         onOpened = { key -> screen = Screen.Chat(key) },
                     )

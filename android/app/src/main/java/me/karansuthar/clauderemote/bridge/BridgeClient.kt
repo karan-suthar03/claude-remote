@@ -10,6 +10,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -55,17 +56,25 @@ class BridgeClient(val url: String) {
 
     private val unreachable get() = "Can't reach $url. Is Tailscale on and the bridge running?"
 
-    /** Sends {t, id, ...fields} and returns the reply. Throws on an error reply, failure or timeout. */
-    suspend fun request(t: String, fields: JSONObject = JSONObject(), timeoutMs: Long = TIMEOUT_MS): JSONObject {
+    /**
+     * Sends {t, id, ...fields} and returns the reply. Throws on an error reply, failure or timeout.
+     * [heavy]: the request is large (e.g. images), so it is serialised off the calling thread.
+     */
+    suspend fun request(
+        t: String,
+        fields: JSONObject = JSONObject(),
+        timeoutMs: Long = TIMEOUT_MS,
+        heavy: Boolean = false,
+    ): JSONObject {
         val id = "a${nextId.incrementAndGet()}"
-        val msg = JSONObject(fields.toString()).put("t", t).put("id", id)
+        val msg = if (heavy) withContext(Dispatchers.Default) { frameOf(t, id, fields) } else frameOf(t, id, fields)
         val reply = CompletableDeferred<JSONObject>()
         pending[id] = reply
         val frame = try {
             withTimeout(timeoutMs) {
                 val c = connect()
                 c.ready.await()
-                if (!c.ws.send(msg.toString())) throw IOException(unreachable)
+                if (!c.ws.send(msg)) throw IOException(unreachable)
                 reply.await()
             }
         } catch (e: TimeoutCancellationException) {
@@ -75,6 +84,13 @@ class BridgeClient(val url: String) {
         }
         if (frame.optString("t") == "error") throw Exception(frame.optString("message", "Bridge error"))
         return frame
+    }
+
+    /** {t, id, ...fields} as text; a shallow copy, so [fields] itself is left as it was. */
+    private fun frameOf(t: String, id: String, fields: JSONObject): String {
+        val names = fields.names()
+        val copy = if (names == null) JSONObject() else JSONObject(fields, Array(names.length()) { names.getString(it) })
+        return copy.put("t", t).put("id", id).toString()
     }
 
     /** Fire-and-forget request (errors ignored), outliving the caller's scope. */

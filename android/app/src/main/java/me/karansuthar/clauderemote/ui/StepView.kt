@@ -28,6 +28,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -119,9 +120,11 @@ private fun StepDetails(step: Step, sessionRunning: Boolean) {
                 maxHeight = 320.dp,
                 isError = step.error,
             )
+            step.images.isNotEmpty() -> Text("Output", style = caption, color = dim)
             !step.done -> Text(if (sessionRunning) "Running…" else "No result", style = caption, color = dim)
             else -> Text("No output", style = caption, color = dim)
         }
+        if (step.images.isNotEmpty()) StepImages(step.images)
     }
 }
 
@@ -153,10 +156,11 @@ private fun ToolBadge(name: String, small: Boolean) {
         color = MaterialTheme.colorScheme.secondaryContainer,
         contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
     ) {
+        val base = if (small) MaterialTheme.typography.labelSmall else MaterialTheme.typography.labelMedium
+        val style = remember(base) { base.copy(fontFamily = FontFamily.Monospace) }
         Text(
             name,
-            style = (if (small) MaterialTheme.typography.labelSmall else MaterialTheme.typography.labelMedium)
-                .copy(fontFamily = FontFamily.Monospace),
+            style = style,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
             modifier = Modifier.widthIn(max = 140.dp).padding(horizontal = 5.dp, vertical = 1.dp),

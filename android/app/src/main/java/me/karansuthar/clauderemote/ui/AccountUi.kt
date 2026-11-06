@@ -40,6 +40,7 @@ import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.Immutable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -63,6 +64,8 @@ import kotlin.math.roundToInt
 
 // ---------------------------------------------------------------- data (fetched live, never stored)
 
+// @Immutable: compared by equals() so the cards skip recomposition when a poll returns the same data.
+@Immutable
 data class AccountInfo(
     val loggedIn: Boolean,
     val email: String?,
@@ -71,8 +74,10 @@ data class AccountInfo(
     val method: String?,
 )
 
+@Immutable
 data class UsageLimit(val name: String, val utilization: Double, val resetsAt: Long?)
 
+@Immutable
 data class UsageInfo(val subscription: String?, val available: Boolean, val limits: List<UsageLimit>)
 
 private fun JSONObject.str(name: String): String? =
