@@ -5,12 +5,16 @@
 #
 # Installs the bridge into ~/.claude-remote, starts it now and at login, and prints the
 # address to enter in the Claude Remote app. Run it again to update.
+# Options: PORT=8001 (if 8000 is taken), WORK_DIR=/path (default folder shortcut in the app).
+#   curl -fsSL .../install.sh | PORT=8001 sh
 # Uninstall: sh ~/.claude-remote/server/scripts/install-linux.sh --remove   (or install-macos.sh)
 set -eu
 
 REPO=karan-suthar03/claude-remote
 BRANCH=main
 DIR="$HOME/.claude-remote"
+PORT="${PORT:-8000}"
+export PORT
 
 step() { printf '\n\033[36m==> %s\033[0m\n' "$1"; }
 fail() { printf '\n\033[31m%s\033[0m\n' "$1"; exit 1; }
@@ -53,7 +57,7 @@ esac
 OK=""
 i=0
 while [ $i -lt 20 ]; do
-  if curl -fs -m 2 "http://$IP:8000/" >/dev/null 2>&1; then OK=1; break; fi
+  if curl -fs -m 2 "http://$IP:$PORT/" >/dev/null 2>&1; then OK=1; break; fi
   sleep 1; i=$((i + 1))
 done
 echo
@@ -61,7 +65,8 @@ if [ -n "$OK" ]; then printf '  \033[32mClaude Remote is running.\033[0m\n'; els
 echo
 echo '  In the Claude Remote app, tap "Add device" and enter:'
 echo
-printf '        \033[33m%s\033[0m\n' "$IP"
+ADDR="$IP"; [ "$PORT" = 8000 ] || ADDR="$IP:$PORT"
+printf '        \033[33m%s\033[0m\n' "$ADDR"
 echo
 echo "  Get the app: https://github.com/$REPO/releases/latest/download/claude-remote.apk"
 echo "  Not signed in to Claude yet? Sign in from the app (device screen > Sign in)."

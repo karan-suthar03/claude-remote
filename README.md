@@ -23,6 +23,25 @@ It ends by printing the address to use, like `100.101.102.103`.
 
 That's it: tap **New session**, pick a folder, and talk to Claude Code.
 
+### Add more computers, including remote servers
+
+Run the same installer on every machine you want to reach: your desktop, a laptop, or a **remote Linux server** (a VPS, a cloud VM, a home server). Each one becomes a device in the app's sidebar, with its own sessions, folders, account and usage. Switch between them from the sidebar.
+
+On a remote server, over SSH:
+
+```sh
+# 1. Tailscale on the server (once), signed in to the same account as your phone
+curl -fsSL https://tailscale.com/install.sh | sh && sudo tailscale up
+
+# 2. The bridge
+curl -fsSL https://raw.githubusercontent.com/karan-suthar03/claude-remote/main/install.sh | sh
+```
+
+- It runs as a service and keeps running after you log out (systemd user service with lingering; on servers without a user session it installs a system service that runs as your user).
+- No browser is needed on the server: sign Claude Code in from the app (device screen → **Sign in**), which shows the sign-in link on your phone.
+- Sessions you start in a terminal on the server (for example over SSH with `claude`) show up in the app live, marked **Terminal**.
+- If port 8000 is taken, install with `| PORT=8001 sh` instead of `| sh`, and add the server in the app as `100.x.y.z:8001`.
+
 ### Or let Claude Code set it up
 
 If you use Claude Code, paste this into it on the computer:

@@ -25,6 +25,10 @@ Repository: https://github.com/karan-suthar03/claude-remote
 
 ## 2. Install the bridge
 
+The same steps work on a desktop, a laptop or a **remote Linux server** (VPS, cloud VM) reached
+over SSH. On a server without Tailscale: `curl -fsSL https://tailscale.com/install.sh | sh && sudo tailscale up`
+(the user must approve the login link it prints). Each machine becomes its own device in the app.
+
 Run the installer for the OS. It downloads the bridge, installs its dependencies, starts it, and
 makes it start automatically at login. Running it again updates it.
 
