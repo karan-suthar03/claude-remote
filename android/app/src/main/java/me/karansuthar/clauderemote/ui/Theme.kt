@@ -165,12 +165,14 @@ val AppShapes = Shapes(
 
 @Composable
 fun AppTheme(content: @Composable () -> Unit) {
-    MaterialTheme(
-        colorScheme = if (isSystemInDarkTheme()) DarkColors else LightColors,
-        typography = AppTypography,
-        shapes = AppShapes,
-        content = content,
-    )
+    val colors = if (isSystemInDarkTheme()) DarkColors else LightColors
+    MaterialTheme(colorScheme = colors, typography = AppTypography, shapes = AppShapes) {
+        // Text outside a Surface would otherwise default to black, invisible on the dark theme.
+        androidx.compose.runtime.CompositionLocalProvider(
+            androidx.compose.material3.LocalContentColor provides colors.onBackground,
+            content = content,
+        )
+    }
 }
 
 // ---------------------------------------------------------------- shared bits
