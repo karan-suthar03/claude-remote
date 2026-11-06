@@ -26,6 +26,8 @@ Node 20 or newer is required. For autostart, see the table in the README's setup
 | `IDLE_PROCESS_MS` | `1800000` (30 min) | How long an open session can go without activity before its Claude Code process is stopped. The session stays open and the process starts again on the next message. |
 | `SESSION_TTL_MS` | `86400000` (24 h) | How long an open session can go without activity before it is closed. It moves to the closed list. |
 | `CLOSED_LIMIT` | `50` | Maximum number of closed (saved) sessions returned by `sessions`. |
+| `ACTIVE_MS` | `120000` | A saved session whose transcript was written this recently (and not by the bridge) is listed as open, as a session running in a terminal. |
+| `IMAGE_LIMIT` | `5242880` | Maximum base64 characters per image (about 3.7 MB of image). Up to 10 images per message. |
 | `OUTPUT_LIMIT` | `20000` | Maximum characters kept for each step's `detail` and `output`. Longer text keeps its start and end, with a `… N characters not shown …` marker between them. |
 
 `WORK_DIR` (optional) adds a **Default folder** shortcut at the top of the app's folder picker. You still choose the folder for each session in the app. The install scripts accept it as `-WorkDir` (Windows) or `WORK_DIR=` (Linux/macOS).
@@ -52,6 +54,7 @@ Each session's process is started with `query()` from the Agent SDK, with these 
 | `disallowedTools` | `AskUserQuestion` | The app can't answer multiple-choice prompts yet, so Claude asks in plain text instead |
 | `thinking` | adaptive, summarized | Shown as the expandable "Thinking" block |
 | `includePartialMessages` | `true` | Streams text and thinking as they are written |
+| `forwardSubagentText` | `true` | Streams subagents' own steps, shown nested under their Agent step |
 | `resume` | the session id | Used when reopening a saved session |
 
 Prompts are fed in streaming-input mode, so one process serves many turns and keeps running between them. That is what lets background tasks and subagents finish while no phone is connected.
@@ -79,12 +82,12 @@ On failure, the reply is `{ t:"error", id, message }`. A frame that isn't valid 
 | `{ t:"info" }` | `{ name, platform, home, sep }` | `platform` is Node's `process.platform`. `sep` is the path separator. |
 | `{ t:"roots" }` | `{ roots:[{ name, path }] }` | `Home` first, then every drive letter that exists (Windows) or `/` (others). |
 | `{ t:"ls", path }` | `{ path, parent, dirs:[{ name, path }] }` | Subfolders only, including symlinks to folders. Normal folders come first, then hidden ones, each sorted alphabetically. `parent` is `null` at a root. Defaults to home. |
-| `{ t:"sessions" }` | `{ open:[Session], closed:[Session] }` | `open`: sessions held by this bridge, newest first. `closed`: sessions Claude Code saved on this computer (from any source, including the terminal) that aren't open, up to `CLOSED_LIMIT`. |
+| `{ t:"sessions" }` | `{ open:[Session], closed:[Session] }` | `open`: sessions held by this bridge, plus sessions running in a terminal right now (`origin:"terminal"`, key `term:<sessionId>`), newest first. `closed`: sessions Claude Code saved on this computer (from any source, including the terminal) that aren't open, up to `CLOSED_LIMIT`. |
 | `{ t:"open", cwd }` | `{ key }` | Opens a new session in `cwd`, which must be an existing folder. No process starts until the first `send`. |
 | `{ t:"open", resume, cwd? }` | `{ key }` | Reopens saved session `resume`, loading its transcript as items. If the session is already open, returns its existing key. `cwd` is looked up if not given. |
 | `{ t:"attach", key }` | `{ session:Session, items:[Item] }` | A snapshot of the chat. After the reply, this socket gets the session's live `ev` frames. Attaching again (for example after a reconnect) replaces the snapshot. |
 | `{ t:"detach", key }` | `{}` | Stops this socket's live events for that session. |
-| `{ t:"send", key, text, model?, effort? }` | `{}` | Sends a user message. Starts the process if needed. A new `model` or `effort` is applied first. The reply comes as soon as the message is queued, and the chat arrives as events. |
+| `{ t:"send", key, text, images?, model?, effort? }` | `{}` | Sends a user message. `images`: up to 10 `{ mediaType, data }` (base64 JPEG, PNG, GIF or WebP); `text` may be empty when images are sent. Sending to a terminal session continues it in the bridge. Starts the process if needed. A new `model` or `effort` is applied first. The reply comes as soon as the message is queued, and the chat arrives as events. |
 | `{ t:"interrupt", key }` | `{}` | Interrupts the current turn, like Esc in the terminal. |
 | `{ t:"close", key }` | `{}` | Ends the Claude Code process and removes the session from `open`. Attached sockets get `{ t:"closed", key }`. The transcript stays on disk, so the session shows in `closed` and can be resumed. |
 | `{ t:"set_model", key, model?, effort? }` | `{ session:Session }` | Changes the model and/or effort. If the process is running, the change applies to it right away. |
@@ -121,6 +124,7 @@ On failure, the reply is `{ t:"error", id, message }`. A frame that isn't valid 
   costUsd,        // total cost of this process so far (open sessions only)
   contextTokens,  // input + cache tokens of the last turn, i.e. current context size
   background,     // background tasks running right now
+  origin,         // "bridge" | "terminal" (running in a terminal, mirrored live)
 }
 ```
 
@@ -130,6 +134,7 @@ On failure, the reply is `{ t:"error", id, message }`. A frame that isn't valid 
 {
   role,           // "user" | "assistant" | "note"   (note: status lines such as limits, errors, compaction)
   text,           // Markdown for assistant items
+  images?,        // user only: [{ mediaType, data }] attached from the phone
   thinking?,      // assistant only
   steps?: [Step], // assistant only, in call order
 }
@@ -148,6 +153,7 @@ On failure, the reply is `{ t:"error", id, message }`. A frame that isn't valid 
   done,           // the result has arrived
   error,          // the tool reported an error
   output,         // the result as text (images become "[image]"), trimmed to OUTPUT_LIMIT
+  images?,        // images in the result, e.g. Read on a PNG: [{ mediaType, data }]
 }
 ```
 
@@ -155,17 +161,26 @@ On failure, the reply is `{ t:"error", id, message }`. A frame that isn't valid 
 
 | `k` | Fields | Effect |
 |---|---|---|
-| `user` | `text` | Appends a user item |
+| `user` | `text, images?` | Appends a user item |
 | `text` | `text` | Appends to the last assistant item's text, creating one if needed |
 | `thinking` | `text` | Appends to the last assistant item's thinking |
 | `sep` | – | A new model message started. Adds a paragraph break if the assistant text doesn't end with one. |
 | `step` | `id, name, label, detail, detailLang, sub` | Adds a step to the last assistant item |
-| `stepDone` | `id, error, output` | Marks the matching step done (searching backwards) |
+| `stepDone` | `id, error, output, images?` | Marks the matching step done (searching backwards) |
 | `note` | `text` | Appends a note item |
 | `state` | `state` | The session's state changed (`running` / `idle`) |
 | `meta` | `session:Session` | Session fields changed: model, effort, cost, context, background tasks, session id |
 
 Notes come from: usage limit warnings and rejections (with reset time), sign-in problems, non-success turn results, context compaction, background task updates, and a Claude Code process that crashed.
+
+## Terminal sessions
+
+Claude Code sessions you run in a terminal on the computer show up in the app too:
+
+- **Detected** when their transcript (`~/.claude/projects/<folder>/<sessionId>.jsonl`) was written in the last `ACTIVE_MS`, and not by the bridge itself. They are listed under **Open** with `origin:"terminal"`, `running` while the transcript changed in the last 8 seconds.
+- **Mirrored live.** Attaching loads the transcript, then the bridge follows the file every second and turns each new entry into the same events as a bridge session. The phone watches the terminal work as it happens.
+- **Continued from the phone.** Sending a message stops the mirror and resumes the session in the bridge (same session id), with a note in the chat. The terminal's own copy doesn't see those messages; quit it there, or continue with `claude --resume` later to pick up everything.
+- A mirror nobody watches is dropped once the terminal has been quiet for `ACTIVE_MS`; the session then appears under **closed**.
 
 ## Session lifecycle
 

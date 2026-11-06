@@ -16,7 +16,8 @@
                                           -> { key }                          an open session's handle
      { t:"attach", key }                  -> { session:Session, items:[Item] } then live { t:"ev", key, e }
      { t:"detach", key }
-     { t:"send", key, text, model?, effort? }
+     { t:"send", key, text, images?:[{mediaType, data}], model?, effort? }
+                                          images: base64 JPEG/PNG/GIF/WebP attached from the phone
      { t:"interrupt", key }
      { t:"close", key }                   ends the Claude Code process; the session becomes closed
      { t:"set_model", key, model?, effort? }   -> { session }   applied live
@@ -29,11 +30,15 @@
    Errors: { t:"error", id, message }. Pushed: { t:"ev", key, e }, { t:"closed", key }.
 
    Session: { key?, sessionId, cwd, title, state:"running"|"idle", lastActive, model, effort,
-              costUsd, contextTokens, background }
-   Item:    { role:"user"|"assistant"|"note", text, thinking?,
+              costUsd, contextTokens, background, origin:"bridge"|"terminal" }
+            origin "terminal": a Claude Code session running in a terminal on this computer
+            (found by its transcript being written in the last ACTIVE_MS). It is mirrored live
+            from its transcript; sending a message continues it in the bridge seamlessly.
+   Item:    { role:"user"|"assistant"|"note", text, images?:[{mediaType, data}], thinking?,
               steps?:[{id, name, label, detail, detailLang, sub, done, error, output}] }
             detail: the call in full (command, diff, file content, JSON input); detailLang: "bash"|"diff"|"json"|""
             output: the tool result as text (trimmed to OUTPUT_LIMIT), like `claude --verbose` shows
+            images: images in the tool result (e.g. Read on a PNG), [{mediaType, data}]
    Event e: { k:"user"|"text"|"thinking"|"sep"|"step"|"stepDone"|"note"|"state"|"meta", ... }
             applied to the items with the same rules on both sides (applyEvent).
    ============================================================== */
@@ -59,6 +64,13 @@ const DEFAULT_EFFORT = process.env.DEFAULT_EFFORT || 'medium';
 const IDLE_PROCESS_MS = Number(process.env.IDLE_PROCESS_MS || 30 * 60_000);
 const SESSION_TTL_MS = Number(process.env.SESSION_TTL_MS || 24 * 3600_000);
 const CLOSED_LIMIT = Number(process.env.CLOSED_LIMIT || 50);
+// A saved session whose transcript changed this recently is treated as running in a terminal.
+const ACTIVE_MS = Number(process.env.ACTIVE_MS || 2 * 60_000);
+const CLAUDE_DIR = process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude');
+// Images: the API accepts these types; each one is capped so chats stay light to sync.
+const IMAGE_TYPES = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp']);
+const IMAGE_LIMIT = Number(process.env.IMAGE_LIMIT || 5 * 1024 * 1024);   // base64 chars per image
+const MAX_IMAGES = 10;
 // Tool output kept per step (characters); longer output keeps its start and end.
 const OUTPUT_LIMIT = Number(process.env.OUTPUT_LIMIT || 20_000);
 
@@ -94,7 +106,7 @@ function applyEvent(items, e) {
     return item;
   };
   switch (e.k) {
-    case 'user': items.push({ role: 'user', text: e.text }); break;
+    case 'user': items.push({ role: 'user', text: e.text, ...(e.images?.length ? { images: e.images } : {}) }); break;
     case 'text': assistant().text += e.text; break;
     case 'thinking': assistant().thinking += e.text; break;
     case 'sep': if (last?.role === 'assistant' && last.text && !last.text.endsWith('\n\n')) last.text += '\n\n'; break;
@@ -107,7 +119,11 @@ function applyEvent(items, e) {
     case 'stepDone':
       for (let i = items.length - 1; i >= 0; i--) {
         const s = items[i].steps?.find(st => st.id === e.id);
-        if (s) { s.done = true; s.error = !!e.error; s.output = e.output ?? ''; break; }
+        if (s) {
+          s.done = true; s.error = !!e.error; s.output = e.output ?? '';
+          if (e.images?.length) s.images = e.images;
+          break;
+        }
       }
       break;
     case 'note': items.push({ role: 'note', text: e.text }); break;
@@ -166,6 +182,15 @@ function trimText(t) {
   return `${t.slice(0, half)}\n… ${t.length - OUTPUT_LIMIT} characters not shown …\n${t.slice(-half)}`;
 }
 
+/** Image blocks (API shape) -> [{mediaType, data}] for the phone, within the size caps. */
+function imagesOf(blocks) {
+  if (!Array.isArray(blocks)) return [];
+  return blocks
+    .filter(b => b?.type === 'image' && b.source?.type === 'base64' && IMAGE_TYPES.has(b.source.media_type) && (b.source.data?.length ?? 0) <= IMAGE_LIMIT)
+    .slice(0, MAX_IMAGES)
+    .map(b => ({ mediaType: b.source.media_type, data: b.source.data }));
+}
+
 /** A tool result's content as plain text. */
 function resultText(content) {
   if (typeof content === 'string') return trimText(content);
@@ -178,38 +203,59 @@ function stepEvent(b, sub) {
   return { k: 'step', id: b.id, name: b.name, label: stepLabel(b.name, b.input), detail, detailLang, sub };
 }
 
+/** One transcript entry (saved message) -> chat events. */
+function entryEvents(m) {
+  const out = [];
+  if (m.isSidechain) return out;
+  const msg = m.message ?? {};
+  const sub = m.parent_tool_use_id != null;
+  const content = typeof msg.content === 'string' ? [{ type: 'text', text: msg.content }] : (msg.content ?? []);
+  if (m.type === 'user') {
+    for (const b of content) if (b.type === 'tool_result') out.push({ k: 'stepDone', id: b.tool_use_id, error: !!b.is_error, output: resultText(b.content), images: imagesOf(b.content) });
+    if (sub || m.isMeta) return out;
+    const text = content.filter(b => b.type === 'text').map(b => b.text).join('\n').trim();
+    const images = imagesOf(content);
+    // Skip Claude Code's own injected notes (command output, reminders).
+    if ((text && !text.startsWith('<')) || images.length) out.push({ k: 'user', text: text.startsWith('<') ? '' : text, images });
+  } else if (m.type === 'assistant') {
+    if (!sub) out.push({ k: 'sep' });
+    for (const b of content) {
+      if (b.type === 'tool_use') out.push(stepEvent(b, sub));
+      else if (sub) continue;
+      else if (b.type === 'text' && b.text) out.push({ k: 'text', text: b.text });
+      else if (b.type === 'thinking' && b.thinking) out.push({ k: 'thinking', text: b.thinking });
+    }
+  }
+  return out;
+}
+
 /** Saved transcript -> chat items (what a terminal session or an earlier run left on disk). */
 function transcriptItems(messages) {
   const items = [];
-  for (const m of messages) {
-    const msg = m.message ?? {};
-    const sub = m.parent_tool_use_id != null;
-    const content = typeof msg.content === 'string' ? [{ type: 'text', text: msg.content }] : (msg.content ?? []);
-    if (m.type === 'user') {
-      for (const b of content) if (b.type === 'tool_result') applyEvent(items, { k: 'stepDone', id: b.tool_use_id, error: !!b.is_error, output: resultText(b.content) });
-      if (sub) continue;
-      const text = content.filter(b => b.type === 'text').map(b => b.text).join('\n').trim();
-      // Skip Claude Code's own injected notes (command output, reminders).
-      if (text && !text.startsWith('<')) applyEvent(items, { k: 'user', text });
-    } else if (m.type === 'assistant') {
-      if (!sub) applyEvent(items, { k: 'sep' });
-      for (const b of content) {
-        if (b.type === 'tool_use') applyEvent(items, stepEvent(b, sub));
-        else if (sub) continue;
-        else if (b.type === 'text' && b.text) applyEvent(items, { k: 'text', text: b.text });
-        else if (b.type === 'thinking' && b.thinking) applyEvent(items, { k: 'thinking', text: b.thinking });
-      }
-    }
-  }
+  for (const m of messages) for (const e of entryEvents(m)) applyEvent(items, e);
   return items;
+}
+
+/** Where Claude Code keeps a session's transcript, or null. */
+function transcriptFile(sessionId) {
+  const root = path.join(CLAUDE_DIR, 'projects');
+  let dirs = [];
+  try { dirs = fs.readdirSync(root, { withFileTypes: true }).filter(d => d.isDirectory()); } catch { return null; }
+  for (const d of dirs) {
+    const f = path.join(root, d.name, `${sessionId}.jsonl`);
+    if (fs.existsSync(f)) return f;
+  }
+  return null;
 }
 
 /* ---------------------------------------------------------------
    An open session: one Claude Code process (started on demand)
    --------------------------------------------------------------- */
 class Session {
-  constructor({ cwd, sessionId = null, title = '', items = [] }) {
-    this.key = randomUUID();
+  constructor({ cwd, sessionId = null, title = '', items = [], key = null, origin = 'bridge' }) {
+    this.key = key ?? randomUUID();
+    this.origin = origin;
+    this.tail = null;            // terminal mirror: { file, offset, rest, timer }
     this.cwd = cwd;
     this.sessionId = sessionId;
     this.title = title;
@@ -231,6 +277,7 @@ class Session {
       key: this.key, sessionId: this.sessionId, cwd: this.cwd, title: this.title || path.basename(this.cwd) || this.cwd,
       state: this.state, lastActive: this.lastActive, model: this.model, effort: this.effort,
       costUsd: this.costUsd, contextTokens: this.contextTokens, background: this.background,
+      origin: this.origin,
     };
   }
 
@@ -238,6 +285,47 @@ class Session {
     applyEvent(this.items, e);
     const frame = JSON.stringify({ t: 'ev', key: this.key, e });
     for (const ws of this.watchers) if (ws.readyState === ws.OPEN) ws.send(frame);
+  }
+
+  /**
+   * Mirrors a session that is running in a terminal: follows its transcript file and turns
+   * each new entry into chat events, so the phone watches it live.
+   */
+  startTail(file) {
+    let offset = 0;
+    try { offset = fs.statSync(file).size; } catch { /* gone */ }
+    this.tail = { file, offset, rest: '' };
+    const poll = () => {
+      if (!this.tail) return;
+      let st;
+      try { st = fs.statSync(file); } catch { return; }
+      const age = Date.now() - st.mtimeMs;
+      this.lastActive = Math.min(Date.now(), st.mtimeMs);
+      if (st.size > this.tail.offset) {
+        const fd = fs.openSync(file, 'r');
+        try {
+          const buf = Buffer.alloc(Math.min(st.size - this.tail.offset, 8 * 1024 * 1024));
+          fs.readSync(fd, buf, 0, buf.length, this.tail.offset);
+          this.tail.offset += buf.length;
+          const lines = (this.tail.rest + buf.toString('utf8')).split('\n');
+          this.tail.rest = lines.pop();
+          for (const line of lines) {
+            if (!line.trim()) continue;
+            let entry;
+            try { entry = JSON.parse(line); } catch { continue; }
+            for (const e of entryEvents(entry)) this.emit(e);
+            if (entry.type === 'summary' && entry.summary && !this.title) this.title = entry.summary;
+          }
+        } finally { fs.closeSync(fd); }
+      }
+      this.setState(age < 8_000 ? 'running' : 'idle');
+    };
+    this.tail.timer = setInterval(poll, 1000);
+    this.tail.timer.unref?.();
+  }
+
+  stopTail() {
+    if (this.tail) { clearInterval(this.tail.timer); this.tail = null; }
   }
 
   /** Pushes the session's changing fields (model, cost, context, background tasks) to attached phones. */
@@ -276,6 +364,8 @@ class Session {
         // Nobody can answer its multiple-choice prompt yet; Claude asks in plain text instead.
         disallowedTools: ['AskUserQuestion'],
         includePartialMessages: true,
+        // Stream subagents' own steps too, so the phone shows them nested under their Agent step.
+        forwardSubagentText: true,
         cwd: this.cwd,
         stderr: () => {},
         ...(this.sessionId ? { resume: this.sessionId } : {}),
@@ -321,7 +411,7 @@ class Session {
           break;
         case 'user':
           for (const b of Array.isArray(msg.message?.content) ? msg.message.content : []) {
-            if (b.type === 'tool_result') this.emit({ k: 'stepDone', id: b.tool_use_id, error: !!b.is_error, output: resultText(b.content) });
+            if (b.type === 'tool_result') this.emit({ k: 'stepDone', id: b.tool_use_id, error: !!b.is_error, output: resultText(b.content), images: imagesOf(b.content) });
           }
           break;
         case 'result': {
@@ -330,8 +420,9 @@ class Session {
           const u = msg.usage ?? {};
           const ctx = (u.input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0);
           if (ctx) this.contextTokens = ctx;
-          this.setState('idle');
+          // Totals first, then idle: a phone treating idle as "turn over" already has them.
           this.meta();
+          this.setState('idle');
           break;
         }
         case 'rate_limit_event': {
@@ -360,9 +451,16 @@ class Session {
     }
   }
 
-  async send(text, model, effort) {
+  async send(text, model, effort, images = []) {
     this.lastActive = Date.now();
-    if (!this.title) this.title = text.slice(0, 80);
+    // Continuing a terminal session from the phone: stop mirroring and resume it here.
+    if (this.origin === 'terminal') {
+      this.stopTail();
+      this.origin = 'bridge';
+      this.emit({ k: 'note', text: 'Continued from the phone. The terminal on the computer won\'t see these new messages.' });
+      this.meta();
+    }
+    if (!this.title) this.title = (text || 'Image').slice(0, 80);
     if (this.q) {
       if (model && model !== this.model) { await this.q.setModel(model).catch(() => {}); this.model = model; }
       if (effort && effort !== this.effort) { await this.q.applyFlagSettings({ effortLevel: effort }).catch(() => {}); this.effort = effort; }
@@ -371,11 +469,15 @@ class Session {
       if (effort) this.effort = effort;
       this.#spawn();
     }
-    this.emit({ k: 'user', text });
+    this.emit({ k: 'user', text, images });
     this.setState('running');
+    const content = [
+      ...images.map(i => ({ type: 'image', source: { type: 'base64', media_type: i.mediaType, data: i.data } })),
+      ...(text ? [{ type: 'text', text }] : []),
+    ];
     this.box.queue.push({
       type: 'user',
-      message: { role: 'user', content: [{ type: 'text', text }] },
+      message: { role: 'user', content },
       parent_tool_use_id: null,
       session_id: this.sessionId ?? '',
     });
@@ -395,6 +497,7 @@ class Session {
 
   /** Stops the Claude Code process; the chat stays and resumes on the next message. */
   stopProcess() {
+    this.stopTail();
     if (this.box) { this.box.closed = true; this.box.wake?.(); }
     try { this.q?.close?.(); } catch { /* already gone */ }
     this.q = null;
@@ -406,15 +509,27 @@ class Session {
    Registry
    --------------------------------------------------------------- */
 const open = new Map();   // key -> Session
+// sessionId -> when the bridge stopped running it. Its transcript was last written by us then,
+// so only writes after that mean someone continued it in a terminal.
+const releasedAt = new Map();
+const touchedSince = (sessionId, mtime) => mtime > (releasedAt.get(sessionId) ?? 0) + 2_000;
 
-async function openSession({ cwd, resume }) {
+async function openSession({ cwd, resume, key }) {
   if (resume) {
     for (const s of open.values()) if (s.sessionId === resume) return s;
     const info = (await listSessions({ limit: 1000 }).catch(() => [])).find(s => s.sessionId === resume);
     const dir = cwd || info?.cwd;
     if (!dir) throw new Error('Unknown session');
     const messages = await getSessionMessages(resume, { dir }).catch(() => []);
-    const s = new Session({ cwd: dir, sessionId: resume, title: info?.customTitle || info?.summary || '', items: transcriptItems(messages) });
+    const file = transcriptFile(resume);
+    const mtime = file ? fs.statSync(file).mtimeMs : 0;
+    const inTerminal = file && Date.now() - mtime < ACTIVE_MS && touchedSince(resume, mtime);
+    const s = new Session({
+      cwd: dir, sessionId: resume, title: info?.customTitle || info?.summary || '', items: transcriptItems(messages),
+      // Keep the key the phone asked for, so its live events reach it even if the terminal went quiet.
+      ...(inTerminal ? { key: `term:${resume}`, origin: 'terminal' } : key ? { key } : {}),
+    });
+    if (inTerminal) { s.lastActive = Math.min(Date.now(), mtime); s.startTail(file); }
     open.set(s.key, s);
     return s;
   }
@@ -427,6 +542,7 @@ async function openSession({ cwd, resume }) {
 }
 
 function closeSession(s) {
+  if (s.sessionId && s.origin === 'bridge') releasedAt.set(s.sessionId, Date.now());
   s.stopProcess();
   open.delete(s.key);
   for (const ws of s.watchers) if (ws.readyState === ws.OPEN) ws.send(JSON.stringify({ t: 'closed', key: s.key }));
@@ -435,6 +551,7 @@ function closeSession(s) {
 setInterval(() => {
   const now = Date.now();
   for (const s of open.values()) {
+    if (s.origin === 'terminal' && !s.watchers.size && now - s.lastActive > ACTIVE_MS) { closeSession(s); continue; }
     if (s.state === 'running') continue;
     if (now - s.lastActive > SESSION_TTL_MS) closeSession(s);
     else if (s.q && now - s.lastActive > IDLE_PROCESS_MS) s.stopProcess();
@@ -616,6 +733,18 @@ async function handle(ws, msg) {
       const live = [...open.values()].map(s => s.info()).sort((a, b) => b.lastActive - a.lastActive);
       const liveIds = new Set(live.map(s => s.sessionId).filter(Boolean));
       const saved = await listSessions({ limit: CLOSED_LIMIT + liveIds.size }).catch(() => []);
+      // Sessions running in a terminal right now count as open, mirrored live on attach.
+      const now = Date.now();
+      for (const s of saved) {
+        if (liveIds.has(s.sessionId) || now - s.lastModified > ACTIVE_MS || !touchedSince(s.sessionId, s.lastModified)) continue;
+        live.push({
+          key: `term:${s.sessionId}`, sessionId: s.sessionId, cwd: s.cwd ?? '', title: s.customTitle || s.summary || s.firstPrompt || '',
+          state: now - s.lastModified < 8_000 ? 'running' : 'idle', lastActive: Math.min(now, s.lastModified),
+          model: null, effort: null, costUsd: 0, contextTokens: 0, background: 0, origin: 'terminal',
+        });
+        liveIds.add(s.sessionId);
+      }
+      live.sort((a, b) => b.lastActive - a.lastActive);
       const closed = saved
         .filter(s => !liveIds.has(s.sessionId))
         .slice(0, CLOSED_LIMIT)
@@ -625,7 +754,9 @@ async function handle(ws, msg) {
     case 'open':
       return { key: (await openSession({ cwd: msg.cwd, resume: msg.resume })).key };
     case 'attach': {
-      const s = open.get(msg.key);
+      let s = open.get(msg.key);
+      // A terminal session's key opens its live mirror on demand (or a normal session if it went quiet).
+      if (!s && String(msg.key).startsWith('term:')) s = await openSession({ resume: String(msg.key).slice(5), key: msg.key });
       if (!s) throw new Error('This session is no longer open');
       s.watchers.add(ws);
       return { session: s.info(), items: s.items };
@@ -637,8 +768,13 @@ async function handle(ws, msg) {
       const s = open.get(msg.key);
       if (!s) throw new Error('This session is no longer open');
       const text = String(msg.text ?? '').trim();
-      if (!text) throw new Error('Empty message');
-      await s.send(text, validModel(msg.model), validEffort(msg.effort));
+      const images = (Array.isArray(msg.images) ? msg.images : [])
+        .filter(i => i && IMAGE_TYPES.has(i.mediaType) && typeof i.data === 'string' && i.data.length <= IMAGE_LIMIT)
+        .slice(0, MAX_IMAGES)
+        .map(i => ({ mediaType: i.mediaType, data: i.data }));
+      if (Array.isArray(msg.images) && images.length < msg.images.length) throw new Error(`Images must be JPEG, PNG, GIF or WebP under ${Math.round(IMAGE_LIMIT / 1024 / 1024 * 0.75)} MB, at most ${MAX_IMAGES}`);
+      if (!text && !images.length) throw new Error('Empty message');
+      await s.send(text, validModel(msg.model), validEffort(msg.effort), images);
       return {};
     }
     case 'set_model': {
