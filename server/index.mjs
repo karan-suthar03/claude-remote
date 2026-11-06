@@ -1,57 +1,70 @@
 /* ==============================================================
-   Claude Code bridge: the phone's connection to Claude Code on this machine.
+   Claude Remote bridge: lets a phone drive Claude Code on this computer.
 
-   Claude Code (through the Claude Agent SDK) runs on the computer's own Claude Code login,
-   so no API key is involved.
+   Claude Code runs through the Claude Agent SDK on this computer's own Claude
+   Code login. Each session is one long-lived Claude Code process in streaming
+   input mode; it keeps running (background tasks, subagents and all) whether or
+   not a phone is connected. Phones attach to a session to get a snapshot of the
+   chat so far and then its live events.
 
-   - One long-lived `query()` per conversation in streaming-input mode, so the
-     Claude Code process stays warm between turns.
-   - A spare process is always pre-spawned, so the first message of a new
-     conversation does not pay for process start-up.
-   - The phone holds a WebSocket open; deltas are forwarded the moment they arrive.
+   Requests (phone -> bridge) carry an `id`; the reply has the same t and id:
+     { t:"info" }                         -> { name, platform, home, sep }
+     { t:"roots" }                        -> { roots:[{name, path}] }        drives / filesystem roots
+     { t:"ls", path }                     -> { path, parent, dirs:[{name, path}] }
+     { t:"sessions" }                     -> { open:[Session], closed:[Session] }
+     { t:"open", cwd } | { t:"open", resume, cwd? }
+                                          -> { key }                          an open session's handle
+     { t:"attach", key }                  -> { session:Session, items:[Item] } then live { t:"ev", key, e }
+     { t:"detach", key }
+     { t:"send", key, text, model?, effort? }
+     { t:"interrupt", key }
+     { t:"close", key }                   ends the Claude Code process; the session becomes closed
+     { t:"set_model", key, model?, effort? }   -> { session }   applied live
+     { t:"models" }                       -> { models:[{value, displayName, description, efforts}] }
+     { t:"usage" }                        -> { subscription, available, limits:[{name, utilization, resetsAt}] }
+     { t:"account" }                      -> { loggedIn, email, org, plan, method }
+     { t:"login_start", console? }        -> { url }                 sign-in link to open on the phone
+     { t:"login_code", code }             -> { ok, account }         the code the sign-in page shows
+     { t:"login_cancel" } / { t:"logout" }
+   Errors: { t:"error", id, message }. Pushed: { t:"ev", key, e }, { t:"closed", key }.
 
-   Protocol (JSON text frames):
-     phone  -> { t: "send", conversation?: sessionId, model?, effort?, content: [blocks] }
-               { t: "cancel" }
-               { t: "warm", conversation }   resume that session now, before the next send
-     server -> { t: "ready" }
-               { t: "session", conversation }     the id to send back next time
-               { t: "thinking", text } / { t: "text", text }
-               { t: "step", name, input, label }  a Claude Code tool is running, for the chat
-               { t: "done", stop, costUsd, ms } / { t: "error", message }
+   Session: { key?, sessionId, cwd, title, state:"running"|"idle", lastActive, model, effort,
+              costUsd, contextTokens, background }
+   Item:    { role:"user"|"assistant"|"note", text, thinking?,
+              steps?:[{id, name, label, detail, detailLang, sub, done, error, output}] }
+            detail: the call in full (command, diff, file content, JSON input); detailLang: "bash"|"diff"|"json"|""
+            output: the tool result as text (trimmed to OUTPUT_LIMIT), like `claude --verbose` shows
+   Event e: { k:"user"|"text"|"thinking"|"sep"|"step"|"stepDone"|"note"|"state"|"meta", ... }
+            applied to the items with the same rules on both sides (applyEvent).
    ============================================================== */
+import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
-import { query } from '@anthropic-ai/claude-agent-sdk';
+import path from 'node:path';
+import { randomUUID } from 'node:crypto';
+import { spawn } from 'node:child_process';
+import { createRequire } from 'node:module';
+import { getSessionMessages, listSessions, query } from '@anthropic-ai/claude-agent-sdk';
 import { WebSocketServer } from 'ws';
 
 const PORT = Number(process.env.PORT || 8000);
 // Listen only on this machine's Tailscale address by default: the bridge has no login of
 // its own and Claude Code can do anything here, so it must not be reachable from the LAN.
 const HOST = process.env.HOST || tailscaleAddress();
-const IDLE_EVICT_MS = Number(process.env.IDLE_EVICT_MS || 30 * 60_000);
-const TURN_TIMEOUT_MS = Number(process.env.TURN_TIMEOUT_MS || 30 * 60_000);
+const NAME = process.env.BRIDGE_NAME || os.hostname();
 const DEFAULT_MODEL = process.env.DEFAULT_MODEL || 'sonnet';
 const DEFAULT_EFFORT = process.env.DEFAULT_EFFORT || 'medium';
-const WORK_DIR = process.env.WORK_DIR || process.env.HOME || process.cwd();
+// An idle session's process is stopped after this long; the session stays open and
+// resumes on the next message. Open sessions untouched for SESSION_TTL_MS are closed.
+const IDLE_PROCESS_MS = Number(process.env.IDLE_PROCESS_MS || 30 * 60_000);
+const SESSION_TTL_MS = Number(process.env.SESSION_TTL_MS || 24 * 3600_000);
+const CLOSED_LIMIT = Number(process.env.CLOSED_LIMIT || 50);
+// Tool output kept per step (characters); longer output keeps its start and end.
+const OUTPUT_LIMIT = Number(process.env.OUTPUT_LIMIT || 20_000);
 
-const MODELS = new Set(['haiku', 'sonnet', 'opus']);
-const EFFORTS = new Set(['low', 'medium', 'high']);
-
-/** A chat line for one of Claude Code's tools. */
-function stepLabel(name, input = {}) {
-  const short = s => { s = String(s ?? ''); return s.length > 60 ? `${s.slice(0, 57)}…` : s; };
-  switch (name) {
-    case 'Bash': return `$ ${short(input.command)}`;
-    case 'Read': return `Reading ${short(input.file_path)}`;
-    case 'Write': return `Writing ${short(input.file_path)}`;
-    case 'Edit': return `Editing ${short(input.file_path)}`;
-    case 'Glob': case 'Grep': return `Searching for ${short(input.pattern)}`;
-    case 'WebFetch': return `Reading ${short(input.url)}`;
-    case 'WebSearch': return `Searching the web for ${short(input.query)}`;
-    default: return name;
-  }
-}
+const EFFORTS = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
+const validModel = m => (typeof m === 'string' && /^[\w.:\[\]-]{1,80}$/.test(m) ? m : undefined);
+const validEffort = e => (EFFORTS.has(e) ? e : undefined);
 
 /** This machine's Tailscale IPv4 address (in 100.64.0.0/10), or null if Tailscale isn't up. */
 function tailscaleAddress() {
@@ -70,179 +83,601 @@ function log(...args) {
 }
 
 /* ---------------------------------------------------------------
-   Conversation: one warm Claude Code process
+   Chat items and events (mirrored in the app)
    --------------------------------------------------------------- */
-class Conversation {
-  #box = null;
+function applyEvent(items, e) {
+  const last = items[items.length - 1];
+  const assistant = () => {
+    if (last?.role === 'assistant') return last;
+    const item = { role: 'assistant', text: '', thinking: '', steps: [] };
+    items.push(item);
+    return item;
+  };
+  switch (e.k) {
+    case 'user': items.push({ role: 'user', text: e.text }); break;
+    case 'text': assistant().text += e.text; break;
+    case 'thinking': assistant().thinking += e.text; break;
+    case 'sep': if (last?.role === 'assistant' && last.text && !last.text.endsWith('\n\n')) last.text += '\n\n'; break;
+    case 'step':
+      assistant().steps.push({
+        id: e.id, name: e.name ?? '', label: e.label, detail: e.detail ?? '', detailLang: e.detailLang ?? '',
+        sub: !!e.sub, done: false, error: false, output: '',
+      });
+      break;
+    case 'stepDone':
+      for (let i = items.length - 1; i >= 0; i--) {
+        const s = items[i].steps?.find(st => st.id === e.id);
+        if (s) { s.done = true; s.error = !!e.error; s.output = e.output ?? ''; break; }
+      }
+      break;
+    case 'note': items.push({ role: 'note', text: e.text }); break;
+    default: break;   // state, meta: session fields, not items
+  }
+}
 
-  constructor({ model = DEFAULT_MODEL, effort = DEFAULT_EFFORT, resume = null } = {}) {
-    this.sessionId = resume;
-    this.model = model;
-    this.effort = effort;
+/** A chat line for one Claude Code tool call. */
+function stepLabel(name, input = {}) {
+  const short = s => { s = String(s ?? '').replace(/\s+/g, ' '); return s.length > 80 ? `${s.slice(0, 77)}…` : s; };
+  switch (name) {
+    case 'Bash': return `${input.run_in_background ? 'Background: ' : ''}$ ${short(input.command)}`;
+    case 'PowerShell': return `${input.run_in_background ? 'Background: ' : ''}PS> ${short(input.command)}`;
+    case 'Read': return `Read ${short(input.file_path)}`;
+    case 'Write': return `Write ${short(input.file_path)}`;
+    case 'Edit': case 'MultiEdit': return `Edit ${short(input.file_path)}`;
+    case 'NotebookEdit': return `Edit ${short(input.notebook_path)}`;
+    case 'Glob': return `Find ${short(input.pattern)}`;
+    case 'Grep': return `Search ${short(input.pattern)}`;
+    case 'WebFetch': return `Fetch ${short(input.url)}`;
+    case 'WebSearch': return `Web search: ${short(input.query)}`;
+    case 'Task': case 'Agent': return `Agent${input.subagent_type ? ` (${input.subagent_type})` : ''}: ${short(input.description || input.prompt)}`;
+    case 'TodoWrite': return `Todos: ${(input.todos ?? []).map(t => `${t.status === 'completed' ? '✓' : t.status === 'in_progress' ? '▸' : '·'} ${t.content}`).join('  ')}`;
+    default: return name.startsWith('mcp__') ? name.split('__').slice(1).join(': ') : name;
+  }
+}
+
+/** The full tool call, for the expandable step: [text, language]. */
+function stepDetail(name, input = {}) {
+  switch (name) {
+    case 'Bash': return [String(input.command ?? ''), 'bash'];
+    case 'PowerShell': return [String(input.command ?? ''), 'powershell'];
+    case 'Edit': return [diffText(input.old_string, input.new_string), 'diff'];
+    case 'MultiEdit': return [(input.edits ?? []).map(e => diffText(e.old_string, e.new_string)).join('\n@@\n'), 'diff'];
+    case 'Write': return [trimText(String(input.content ?? '')), langOf(input.file_path)];
+    case 'Read': case 'Glob': case 'Grep': case 'WebFetch': case 'WebSearch': case 'TodoWrite': return ['', ''];
+    case 'Task': case 'Agent': return [String(input.prompt ?? ''), ''];
+    default: return [trimText(JSON.stringify(input, null, 2)), 'json'];
+  }
+}
+
+function diffText(oldS = '', newS = '') {
+  const minus = String(oldS).split('\n').map(l => `-${l}`);
+  const plus = String(newS).split('\n').map(l => `+${l}`);
+  return trimText([...minus, ...plus].join('\n'));
+}
+
+function langOf(file = '') {
+  const ext = path.extname(String(file)).slice(1).toLowerCase();
+  return ext || '';
+}
+
+function trimText(t) {
+  if (t.length <= OUTPUT_LIMIT) return t;
+  const half = Math.floor(OUTPUT_LIMIT / 2);
+  return `${t.slice(0, half)}\n… ${t.length - OUTPUT_LIMIT} characters not shown …\n${t.slice(-half)}`;
+}
+
+/** A tool result's content as plain text. */
+function resultText(content) {
+  if (typeof content === 'string') return trimText(content);
+  if (!Array.isArray(content)) return '';
+  return trimText(content.map(b => (b.type === 'text' ? b.text : b.type === 'image' ? '[image]' : '')).filter(Boolean).join('\n'));
+}
+
+function stepEvent(b, sub) {
+  const [detail, detailLang] = stepDetail(b.name, b.input);
+  return { k: 'step', id: b.id, name: b.name, label: stepLabel(b.name, b.input), detail, detailLang, sub };
+}
+
+/** Saved transcript -> chat items (what a terminal session or an earlier run left on disk). */
+function transcriptItems(messages) {
+  const items = [];
+  for (const m of messages) {
+    const msg = m.message ?? {};
+    const sub = m.parent_tool_use_id != null;
+    const content = typeof msg.content === 'string' ? [{ type: 'text', text: msg.content }] : (msg.content ?? []);
+    if (m.type === 'user') {
+      for (const b of content) if (b.type === 'tool_result') applyEvent(items, { k: 'stepDone', id: b.tool_use_id, error: !!b.is_error, output: resultText(b.content) });
+      if (sub) continue;
+      const text = content.filter(b => b.type === 'text').map(b => b.text).join('\n').trim();
+      // Skip Claude Code's own injected notes (command output, reminders).
+      if (text && !text.startsWith('<')) applyEvent(items, { k: 'user', text });
+    } else if (m.type === 'assistant') {
+      if (!sub) applyEvent(items, { k: 'sep' });
+      for (const b of content) {
+        if (b.type === 'tool_use') applyEvent(items, stepEvent(b, sub));
+        else if (sub) continue;
+        else if (b.type === 'text' && b.text) applyEvent(items, { k: 'text', text: b.text });
+        else if (b.type === 'thinking' && b.thinking) applyEvent(items, { k: 'thinking', text: b.thinking });
+      }
+    }
+  }
+  return items;
+}
+
+/* ---------------------------------------------------------------
+   An open session: one Claude Code process (started on demand)
+   --------------------------------------------------------------- */
+class Session {
+  constructor({ cwd, sessionId = null, title = '', items = [] }) {
+    this.key = randomUUID();
+    this.cwd = cwd;
+    this.sessionId = sessionId;
+    this.title = title;
+    this.items = items;
+    this.state = 'idle';
+    this.model = DEFAULT_MODEL;
+    this.effort = DEFAULT_EFFORT;
+    this.lastActive = Date.now();
+    this.costUsd = 0;
+    this.contextTokens = 0;
+    this.background = 0;         // live background tasks
+    this.watchers = new Set();   // sockets attached to this session
     this.q = null;
-    this.busy = Promise.resolve();
-    this.lastUsed = Date.now();
-    this.#spawn();
+    this.box = null;
+  }
+
+  info() {
+    return {
+      key: this.key, sessionId: this.sessionId, cwd: this.cwd, title: this.title || path.basename(this.cwd) || this.cwd,
+      state: this.state, lastActive: this.lastActive, model: this.model, effort: this.effort,
+      costUsd: this.costUsd, contextTokens: this.contextTokens, background: this.background,
+    };
+  }
+
+  emit(e) {
+    applyEvent(this.items, e);
+    const frame = JSON.stringify({ t: 'ev', key: this.key, e });
+    for (const ws of this.watchers) if (ws.readyState === ws.OPEN) ws.send(frame);
+  }
+
+  /** Pushes the session's changing fields (model, cost, context, background tasks) to attached phones. */
+  meta() {
+    this.emit({ k: 'meta', session: this.info() });
+  }
+
+  setState(state) {
+    if (state === this.state) return;
+    this.state = state;
+    this.emit({ k: 'state', state });
   }
 
   #spawn() {
     const box = { queue: [], wake: null, closed: false };
-    this.#box = box;
+    this.box = box;
     const input = (async function* () {
       while (!box.closed) {
         if (box.queue.length) { yield box.queue.shift(); continue; }
         await new Promise(resolve => { box.wake = resolve; });
       }
     })();
-    this.iter = null;
-    this.q = query({
+    const q = query({
       prompt: input,
       options: {
         model: this.model,
         effort: this.effort,
         thinking: { type: 'adaptive', display: 'summarized' },
-        // Plain Claude Code: its own prompt, tools and the user's/project's settings and CLAUDE.md.
+        // Plain Claude Code: its own prompt and tools, plus this computer's and the folder's
+        // settings and CLAUDE.md, exactly like running `claude` in that folder.
         systemPrompt: { type: 'preset', preset: 'claude_code' },
         settingSources: ['user', 'project', 'local'],
-        // TODO: permission prompts on the phone. For now nothing asks.
+        // TODO: approve permissions from the phone. For now nothing asks.
         permissionMode: 'bypassPermissions',
         allowDangerouslySkipPermissions: true,
+        // Nobody can answer its multiple-choice prompt yet; Claude asks in plain text instead.
+        disallowedTools: ['AskUserQuestion'],
         includePartialMessages: true,
-        cwd: WORK_DIR,
+        cwd: this.cwd,
         stderr: () => {},
         ...(this.sessionId ? { resume: this.sessionId } : {}),
       },
     });
+    this.q = q;
+    this.#pump(q).catch(err => {
+      log(`session ${this.key.slice(0, 8)} failed:`, err.message);
+      this.emit({ k: 'note', text: `Claude Code stopped: ${err.message}` });
+    }).finally(() => {
+      if (this.q === q) { this.q = null; this.box = null; this.background = 0; }
+      this.setState('idle');
+    });
   }
 
-  #push(content) {
-    this.#box.queue.push({
+  /** Reads everything Claude Code emits for as long as the process lives: turns, background tasks, subagents. */
+  async #pump(q) {
+    const it = q[Symbol.asyncIterator]();
+    for (;;) {
+      const { value: msg, done } = await it.next();
+      if (done) return;
+      this.lastActive = Date.now();
+      const sub = msg.parent_tool_use_id != null;
+      if (msg.session_id && msg.session_id !== this.sessionId) {
+        this.sessionId = msg.session_id;
+        this.meta();
+      }
+      switch (msg.type) {
+        case 'stream_event': {
+          if (sub) break;
+          const ev = msg.event;
+          if (ev?.type === 'message_start') this.emit({ k: 'sep' });
+          else if (ev?.type === 'content_block_delta') {
+            if (ev.delta?.type === 'text_delta' && ev.delta.text) this.emit({ k: 'text', text: ev.delta.text });
+            else if (ev.delta?.type === 'thinking_delta' && ev.delta.thinking) this.emit({ k: 'thinking', text: ev.delta.thinking });
+          }
+          break;
+        }
+        case 'assistant':
+          for (const b of msg.message?.content ?? []) {
+            if (b.type === 'tool_use') this.emit(stepEvent(b, sub));
+          }
+          break;
+        case 'user':
+          for (const b of Array.isArray(msg.message?.content) ? msg.message.content : []) {
+            if (b.type === 'tool_result') this.emit({ k: 'stepDone', id: b.tool_use_id, error: !!b.is_error, output: resultText(b.content) });
+          }
+          break;
+        case 'result': {
+          if (msg.subtype !== 'success') this.emit({ k: 'note', text: msg.result || `Turn ended: ${msg.subtype}` });
+          if (typeof msg.total_cost_usd === 'number') this.costUsd = msg.total_cost_usd;
+          const u = msg.usage ?? {};
+          const ctx = (u.input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0);
+          if (ctx) this.contextTokens = ctx;
+          this.setState('idle');
+          this.meta();
+          break;
+        }
+        case 'rate_limit_event': {
+          const r = msg.rate_limit_info ?? {};
+          if (r.status === 'rejected' || r.status === 'allowed_warning') {
+            const when = r.resetsAt ? ` (resets ${new Date(r.resetsAt * 1000).toLocaleString()})` : '';
+            const kind = r.rateLimitType ? `: ${r.rateLimitType.replace(/_/g, ' ')}` : '';
+            this.emit({ k: 'note', text: `${r.status === 'rejected' ? 'Usage limit reached' : 'Close to your usage limit'}${kind}${when}` });
+          }
+          break;
+        }
+        case 'auth_status':
+          if (msg.error) this.emit({ k: 'note', text: `Sign-in problem: ${msg.error}. Sign in again from the device screen.` });
+          break;
+        case 'system':
+          if (msg.subtype === 'session_state_changed') this.setState(msg.state === 'idle' ? 'idle' : 'running');
+          else if (msg.subtype === 'background_tasks_changed') { this.background = (msg.tasks ?? []).length; this.meta(); }
+          else if (msg.subtype === 'compact_boundary') this.emit({ k: 'note', text: 'Conversation compacted to free up context' });
+          else if (/^task_/.test(msg.subtype ?? '')) {
+            const text = msg.summary || msg.description || msg.status;
+            if (text) this.emit({ k: 'note', text: `Background task: ${text}` });
+          }
+          break;
+        default: break;
+      }
+    }
+  }
+
+  async send(text, model, effort) {
+    this.lastActive = Date.now();
+    if (!this.title) this.title = text.slice(0, 80);
+    if (this.q) {
+      if (model && model !== this.model) { await this.q.setModel(model).catch(() => {}); this.model = model; }
+      if (effort && effort !== this.effort) { await this.q.applyFlagSettings({ effortLevel: effort }).catch(() => {}); this.effort = effort; }
+    } else {
+      if (model) this.model = model;
+      if (effort) this.effort = effort;
+      this.#spawn();
+    }
+    this.emit({ k: 'user', text });
+    this.setState('running');
+    this.box.queue.push({
       type: 'user',
-      message: { role: 'user', content },
+      message: { role: 'user', content: [{ type: 'text', text }] },
       parent_tool_use_id: null,
       session_id: this.sessionId ?? '',
     });
-    this.#box.wake?.();
-    this.#box.wake = null;
+    this.box.wake?.();
+    this.box.wake = null;
   }
 
-  async #apply(model, effort) {
-    if (model && model !== this.model) {
-      await this.q.setModel(model);
-      this.model = model;
-    }
-    if (effort && effort !== this.effort) {
-      await this.q.applyFlagSettings({ effortLevel: effort });
-      this.effort = effort;
-    }
+  async setModel(model, effort) {
+    if (model) { if (this.q) await this.q.setModel(model).catch(() => {}); this.model = model; }
+    if (effort) { if (this.q) await this.q.applyFlagSettings({ effortLevel: effort }).catch(() => {}); this.effort = effort; }
+    this.meta();
   }
 
-  /** Runs one turn; turns on the same conversation queue behind each other. */
-  ask(content, { model, effort }, sink, signal) {
-    const run = async () => {
-      if (signal.aborted) return;
-      this.lastUsed = Date.now();
-      await this.#apply(model, effort);
-      await this.#turn(content, sink, signal);
-    };
-    this.busy = this.busy.catch(() => {}).then(run);
-    return this.busy;
+  interrupt() {
+    this.q?.interrupt?.().catch(() => {});
   }
 
-  async #turn(content, sink, signal) {
-    const started = Date.now();
-    let firstToken = 0;
-    let emitted = false;
-    const interrupt = () => { this.q?.interrupt?.().catch(() => {}); };
-    const deadline = setTimeout(interrupt, TURN_TIMEOUT_MS);
-    signal.addEventListener('abort', interrupt, { once: true });
-    this.#push(content);
-
-    // Read the stream by hand: `for await` would call return() when the turn ends,
-    // which closes Claude Code and kills the warm process for the next turn.
-    this.iter ??= this.q[Symbol.asyncIterator]();
-    try {
-      for (;;) {
-        const { value: msg, done } = await this.iter.next();
-        if (done) break;
-        if (msg.session_id && msg.session_id !== this.sessionId) {
-          this.sessionId = msg.session_id;
-          sink({ t: 'session', conversation: this.sessionId });
-        }
-        if (msg.type === 'stream_event' && msg.event?.type === 'content_block_delta') {
-          const d = msg.event.delta;
-          if (d?.type === 'text_delta' && d.text) {
-            if (!firstToken) firstToken = Date.now() - started;
-            emitted = true;
-            sink({ t: 'text', text: d.text });
-          } else if (d?.type === 'thinking_delta' && d.thinking) {
-            if (!firstToken) firstToken = Date.now() - started;
-            sink({ t: 'thinking', text: d.thinking });
-          }
-          continue;
-        }
-        if (msg.type === 'assistant') {
-          for (const block of msg.message?.content ?? []) {
-            if (block.type === 'tool_use') {
-              sink({ t: 'step', name: block.name, input: block.input, label: stepLabel(block.name, block.input) });
-            }
-          }
-          continue;
-        }
-        if (msg.type === 'result') {
-          if (msg.subtype !== 'success' && !emitted) {
-            sink({ t: 'error', message: msg.result || `Turn ended: ${msg.subtype}` });
-          } else {
-            sink({ t: 'done', stop: msg.subtype, costUsd: msg.total_cost_usd, ms: Date.now() - started });
-          }
-          log(`turn ${this.sessionId?.slice(0, 8)} model=${this.model} first=${firstToken}ms total=${Date.now() - started}ms`);
-          return;
-        }
-      }
-      throw new Error('Claude Code exited before answering');
-    } finally {
-      clearTimeout(deadline);
-      signal.removeEventListener('abort', interrupt);
-    }
-  }
-
-  close() {
-    if (this.#box) {
-      this.#box.closed = true;
-      this.#box.wake?.();
-      this.#box = null;
-    }
+  /** Stops the Claude Code process; the chat stays and resumes on the next message. */
+  stopProcess() {
+    if (this.box) { this.box.closed = true; this.box.wake?.(); }
     try { this.q?.close?.(); } catch { /* already gone */ }
     this.q = null;
+    this.box = null;
   }
 }
 
 /* ---------------------------------------------------------------
-   Registry, with one spare warm process for the next new chat
+   Registry
    --------------------------------------------------------------- */
-const conversations = new Map();   // sessionId -> Conversation
-let spare = new Conversation();
+const open = new Map();   // key -> Session
 
-function take(conversationId, model, effort) {
-  if (conversationId) {
-    const live = conversations.get(conversationId);
-    if (live) return live;
-    // Evicted or the server restarted: resume the saved Claude Code session.
-    const resumed = new Conversation({ model, effort, resume: conversationId });
-    conversations.set(conversationId, resumed);
-    return resumed;
+async function openSession({ cwd, resume }) {
+  if (resume) {
+    for (const s of open.values()) if (s.sessionId === resume) return s;
+    const info = (await listSessions({ limit: 1000 }).catch(() => [])).find(s => s.sessionId === resume);
+    const dir = cwd || info?.cwd;
+    if (!dir) throw new Error('Unknown session');
+    const messages = await getSessionMessages(resume, { dir }).catch(() => []);
+    const s = new Session({ cwd: dir, sessionId: resume, title: info?.customTitle || info?.summary || '', items: transcriptItems(messages) });
+    open.set(s.key, s);
+    return s;
   }
-  const fresh = spare;
-  spare = new Conversation();
-  return fresh;
+  if (!cwd) throw new Error('No folder given');
+  const dir = path.resolve(String(cwd));
+  if (!fs.statSync(dir, { throwIfNoEntry: false })?.isDirectory()) throw new Error(`Not a folder: ${cwd}`);
+  const s = new Session({ cwd: dir });
+  open.set(s.key, s);
+  return s;
+}
+
+function closeSession(s) {
+  s.stopProcess();
+  open.delete(s.key);
+  for (const ws of s.watchers) if (ws.readyState === ws.OPEN) ws.send(JSON.stringify({ t: 'closed', key: s.key }));
 }
 
 setInterval(() => {
-  const cutoff = Date.now() - IDLE_EVICT_MS;
-  for (const [id, c] of conversations) {
-    if (c.lastUsed < cutoff) { c.close(); conversations.delete(id); }
+  const now = Date.now();
+  for (const s of open.values()) {
+    if (s.state === 'running') continue;
+    if (now - s.lastActive > SESSION_TTL_MS) closeSession(s);
+    else if (s.q && now - s.lastActive > IDLE_PROCESS_MS) s.stopProcess();
   }
 }, 60_000).unref();
+
+/* ---------------------------------------------------------------
+   Folders
+   --------------------------------------------------------------- */
+function roots() {
+  const home = [{ name: 'Home', path: os.homedir() }];
+  // WORK_DIR, if set, is offered first as a shortcut to where you usually work.
+  if (process.env.WORK_DIR && fs.existsSync(process.env.WORK_DIR)) home.unshift({ name: 'Default folder', path: path.resolve(process.env.WORK_DIR) });
+  if (process.platform !== 'win32') return [...home, { name: '/', path: '/' }];
+  const drives = [];
+  for (let c = 65; c <= 90; c++) {
+    const p = `${String.fromCharCode(c)}:\\`;
+    try { fs.accessSync(p); drives.push({ name: p, path: p }); } catch { /* no such drive */ }
+  }
+  return [...home, ...drives];
+}
+
+// Operating-system folders nobody runs Claude Code in.
+const SYSTEM_DIRS = process.platform === 'win32'
+  ? /^(\$.*|System Volume Information|Config\.Msi|Recovery|PerfLogs|Documents and Settings)$/i
+  : /^(lost\+found)$/;
+
+function listDirs(dir) {
+  const full = path.resolve(dir);
+  const dirs = [];
+  for (const d of fs.readdirSync(full, { withFileTypes: true })) {
+    let isDir = d.isDirectory();
+    if (!isDir && d.isSymbolicLink()) {
+      try { isDir = fs.statSync(path.join(full, d.name)).isDirectory(); } catch { /* broken link */ }
+    }
+    if (isDir && !SYSTEM_DIRS.test(d.name)) dirs.push({ name: d.name, path: path.join(full, d.name) });
+  }
+  // Ordinary folders first, then hidden ones; each alphabetical.
+  dirs.sort((a, b) => (a.name.startsWith('.') - b.name.startsWith('.')) || a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }));
+  const parent = path.dirname(full);
+  return { path: full, parent: parent === full ? null : parent, dirs };
+}
+
+/* ---------------------------------------------------------------
+   Account, models and plan usage
+   --------------------------------------------------------------- */
+/** The Claude Code executable the SDK runs, so login applies to exactly what the sessions use. */
+function claudeBinary() {
+  const require = createRequire(import.meta.url);
+  try {
+    const dir = path.dirname(require.resolve(`@anthropic-ai/claude-agent-sdk-${process.platform}-${process.arch}/package.json`));
+    const exe = path.join(dir, process.platform === 'win32' ? 'claude.exe' : 'claude');
+    if (fs.existsSync(exe)) return exe;
+  } catch { /* fall back to PATH */ }
+  return 'claude';
+}
+
+function runClaude(args, timeoutMs = 30_000) {
+  return new Promise((resolve, reject) => {
+    const p = spawn(claudeBinary(), args, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+    let out = '';
+    p.stdout.on('data', d => { out += d; });
+    p.stderr.on('data', d => { out += d; });
+    const timer = setTimeout(() => { p.kill(); reject(new Error('Claude Code did not answer in time')); }, timeoutMs);
+    p.on('error', err => { clearTimeout(timer); reject(err); });
+    p.on('close', code => { clearTimeout(timer); resolve({ code, out }); });
+  });
+}
+
+async function account() {
+  const { out } = await runClaude(['auth', 'status', '--json']);
+  let s;
+  try { s = JSON.parse(out); } catch { return { loggedIn: false }; }
+  return { loggedIn: !!s.loggedIn, email: s.email ?? null, org: s.orgName ?? null, plan: s.subscriptionType ?? null, method: s.authMethod ?? null };
+}
+
+/** Runs fn against a Claude Code process: a live session's if there is one, else a short-lived one. */
+async function withProbe(fn) {
+  const live = [...open.values()].find(s => s.q);
+  if (live) return fn(live.q);
+  const box = { closed: false, wake: null };
+  const input = (async function* () { while (!box.closed) await new Promise(r => { box.wake = r; }); })();
+  const q = query({ prompt: input, options: { cwd: os.homedir(), settingSources: ['user'], stderr: () => {} } });
+  try {
+    return await fn(q);
+  } finally {
+    box.closed = true;
+    box.wake?.();
+    try { q.close(); } catch { /* gone */ }
+  }
+}
+
+let modelCache = null;   // { at, models }
+async function models() {
+  if (modelCache && Date.now() - modelCache.at < 10 * 60_000) return modelCache.models;
+  const list = await withProbe(q => q.supportedModels());
+  const result = list.map(m => ({
+    value: m.value, displayName: m.displayName, description: m.description ?? '',
+    efforts: m.supportedEffortLevels ?? (m.supportsEffort ? ['low', 'medium', 'high'] : []),
+  }));
+  modelCache = { at: Date.now(), models: result };
+  return result;
+}
+
+async function usage() {
+  const u = await withProbe(q => q.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET({ skipBehaviors: true }));
+  const names = {
+    five_hour: 'Current session (5 h)', seven_day: 'This week', seven_day_opus: 'This week (Opus)',
+    seven_day_sonnet: 'This week (Sonnet)', seven_day_oauth_apps: 'This week (apps)',
+  };
+  const limits = Object.entries(u?.rate_limits ?? {})
+    .filter(([, v]) => v && v.utilization != null)
+    .map(([k, v]) => ({ name: names[k] ?? k.replace(/_/g, ' '), utilization: v.utilization, resetsAt: v.resets_at }));
+  return { subscription: u?.subscription_type ?? null, available: !!u?.rate_limits_available, limits };
+}
+
+/* Login: `claude auth login` prints a link, then waits for the code the sign-in page shows. */
+let login = null;   // { proc, out, done }
+
+function loginStart(consoleLogin) {
+  loginCancel();
+  const proc = spawn(claudeBinary(), ['auth', 'login', consoleLogin ? '--console' : '--claudeai'], {
+    stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true, env: { ...process.env, BROWSER: 'none' },
+  });
+  const state = { proc, out: '' };
+  state.done = new Promise(resolve => proc.on('close', code => resolve(code)));
+  login = state;
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => { loginCancel(); reject(new Error('Claude Code did not show a sign-in link')); }, 20_000);
+    const onData = d => {
+      state.out += d;
+      const m = state.out.match(/https:\/\/\S+/);
+      if (m) { clearTimeout(timer); resolve({ url: m[0] }); }
+    };
+    proc.stdout.on('data', onData);
+    proc.stderr.on('data', onData);
+    proc.on('error', err => { clearTimeout(timer); reject(err); });
+    state.done.then(code => { clearTimeout(timer); reject(new Error(`Sign-in ended early (${code}): ${state.out.trim().slice(-200)}`)); });
+  });
+}
+
+async function loginCode(code) {
+  if (!login) throw new Error('No sign-in in progress. Start again.');
+  const state = login;
+  const before = state.out.length;
+  state.proc.stdin.write(`${String(code ?? '').trim()}\n`);
+  const exit = await Promise.race([state.done, new Promise(r => setTimeout(() => r('timeout'), 60_000))]);
+  // eslint-disable-next-line no-control-regex
+  const said = state.out.slice(before).replace(/\x1b\[[0-9;]*[A-Za-z]/g, '').trim();
+  if (exit === 'timeout') { loginCancel(); throw new Error('Sign-in timed out. Start again.'); }
+  login = null;
+  modelCache = null;
+  const acct = await account().catch(() => ({ loggedIn: false }));
+  if (exit !== 0 || !acct.loggedIn) throw new Error(said.split('\n').pop() || 'Sign-in failed. Check the code and start again.');
+  // Running sessions keep the old login until their process restarts.
+  for (const s of open.values()) if (s.state !== 'running') s.stopProcess();
+  return { ok: true, account: acct };
+}
+
+function loginCancel() {
+  if (login) {
+    try { login.proc.kill(); } catch { /* gone */ }
+    login = null;
+  }
+}
+
+/* ---------------------------------------------------------------
+   Requests
+   --------------------------------------------------------------- */
+async function handle(ws, msg) {
+  switch (msg.t) {
+    case 'info':
+      return { name: NAME, platform: process.platform, home: os.homedir(), sep: path.sep };
+    case 'roots':
+      return { roots: roots() };
+    case 'ls':
+      return listDirs(String(msg.path || os.homedir()));
+    case 'sessions': {
+      const live = [...open.values()].map(s => s.info()).sort((a, b) => b.lastActive - a.lastActive);
+      const liveIds = new Set(live.map(s => s.sessionId).filter(Boolean));
+      const saved = await listSessions({ limit: CLOSED_LIMIT + liveIds.size }).catch(() => []);
+      const closed = saved
+        .filter(s => !liveIds.has(s.sessionId))
+        .slice(0, CLOSED_LIMIT)
+        .map(s => ({ sessionId: s.sessionId, cwd: s.cwd ?? '', title: s.customTitle || s.summary || s.firstPrompt || '', state: 'idle', lastActive: s.lastModified }));
+      return { open: live, closed };
+    }
+    case 'open':
+      return { key: (await openSession({ cwd: msg.cwd, resume: msg.resume })).key };
+    case 'attach': {
+      const s = open.get(msg.key);
+      if (!s) throw new Error('This session is no longer open');
+      s.watchers.add(ws);
+      return { session: s.info(), items: s.items };
+    }
+    case 'detach':
+      open.get(msg.key)?.watchers.delete(ws);
+      return {};
+    case 'send': {
+      const s = open.get(msg.key);
+      if (!s) throw new Error('This session is no longer open');
+      const text = String(msg.text ?? '').trim();
+      if (!text) throw new Error('Empty message');
+      await s.send(text, validModel(msg.model), validEffort(msg.effort));
+      return {};
+    }
+    case 'set_model': {
+      const s = open.get(msg.key);
+      if (!s) throw new Error('This session is no longer open');
+      await s.setModel(validModel(msg.model), validEffort(msg.effort));
+      return { session: s.info() };
+    }
+    case 'models':
+      return { models: await models() };
+    case 'usage':
+      return await usage();
+    case 'account':
+      return await account();
+    case 'login_start':
+      return await loginStart(!!msg.console);
+    case 'login_code':
+      return await loginCode(msg.code);
+    case 'login_cancel':
+      loginCancel();
+      return {};
+    case 'logout': {
+      await runClaude(['auth', 'logout']);
+      for (const s of open.values()) s.stopProcess();
+      modelCache = null;
+      return await account();
+    }
+    case 'interrupt':
+      open.get(msg.key)?.interrupt();
+      return {};
+    case 'close': {
+      const s = open.get(msg.key);
+      if (s) closeSession(s);
+      return {};
+    }
+    default:
+      throw new Error(`Unknown request: ${msg.t}`);
+  }
+}
 
 /* ---------------------------------------------------------------
    HTTP (health) + WebSocket
@@ -254,58 +689,64 @@ if (!HOST) {
 
 const server = http.createServer((req, res) => {
   res.writeHead(200, { 'content-type': 'application/json' });
-  res.end(JSON.stringify({ service: 'claude-remote', status: 'ok', live: conversations.size, uptime_s: Math.round(process.uptime()) }));
+  res.end(JSON.stringify({ service: 'claude-remote', name: NAME, status: 'ok', open: open.size, uptime_s: Math.round(process.uptime()) }));
 });
 
 const wss = new WebSocketServer({ server, path: '/ws', perMessageDeflate: false });
 
+// Drop phones that went away without closing the socket (network change, sleep).
+const heartbeat = setInterval(() => {
+  for (const ws of wss.clients) {
+    if (ws.alive === false) { ws.terminate(); continue; }
+    ws.alive = false;
+    ws.ping();
+  }
+}, 30_000);
+wss.on('close', () => clearInterval(heartbeat));
+
 wss.on('connection', (ws, req) => {
   log('connect', req.socket.remoteAddress);
   ws._socket.setNoDelay(true);
-  let current = null;   // AbortController of the running turn
-  const sink = frame => { if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(frame)); };
-  sink({ t: 'ready' });
+  ws.alive = true;
+  ws.on('pong', () => { ws.alive = true; });
+  const reply = frame => { if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(frame)); };
+  reply({ t: 'ready', name: NAME });
 
   ws.on('message', async raw => {
     let msg;
-    try { msg = JSON.parse(raw); } catch { return sink({ t: 'error', message: 'bad frame' }); }
-
-    if (msg.t === 'cancel') { current?.abort(); return; }
-    if (msg.t === 'warm') {
-      if (typeof msg.conversation === 'string' && msg.conversation) take(msg.conversation);
-      return;
-    }
-    if (msg.t !== 'send') return;
-
-    const model = MODELS.has(msg.model) ? msg.model : undefined;
-    const effort = EFFORTS.has(msg.effort) ? msg.effort : undefined;
-    const content = Array.isArray(msg.content) && msg.content.length ? msg.content : null;
-    if (!content) return sink({ t: 'error', message: 'empty message' });
-
-    const conversation = take(msg.conversation, model, effort);
-    current = new AbortController();
+    try { msg = JSON.parse(raw); } catch { return reply({ t: 'error', message: 'bad frame' }); }
     try {
-      await conversation.ask(content, { model, effort }, frame => {
-        if (frame.t === 'session') conversations.set(frame.conversation, conversation);
-        sink(frame);
-      }, current.signal);
+      reply({ t: msg.t, id: msg.id, ...(await handle(ws, msg)) });
     } catch (err) {
-      log('turn failed:', err.message);
-      sink({ t: 'error', message: err.message });
-      conversation.close();
-      for (const [id, c] of conversations) if (c === conversation) conversations.delete(id);
+      reply({ t: 'error', id: msg.id, message: err.message });
     }
   });
 
-  ws.on('close', () => current?.abort());
+  ws.on('close', () => {
+    log('disconnect', req.socket.remoteAddress);
+    for (const s of open.values()) s.watchers.delete(ws);
+  });
+  ws.on('error', err => log('socket error:', err.message));
 });
 
-server.listen(PORT, HOST, () => log(`claude-remote server on ${HOST}:${PORT}, spare process warming`));
+server.on('error', err => {
+  console.error(err.code === 'EADDRINUSE' ? `Port ${PORT} is already in use. Is another bridge running? Set PORT to use another.` : err.message);
+  process.exit(1);
+});
+
+server.listen(PORT, HOST, () => {
+  log(`claude-remote bridge "${NAME}" on ${HOST}:${PORT}`);
+  log(`Add it in the app with the address ${HOST}${PORT === 8000 ? '' : `:${PORT}`}`);
+  account().then(a => log(a.loggedIn ? `Claude Code signed in as ${a.email ?? 'unknown'} (${a.plan ?? a.method ?? 'unknown plan'})` : 'Claude Code is NOT signed in: sign in from the app, or run `claude` here once')).catch(() => {});
+});
+
+// One misbehaving session must not take the whole bridge (and every other session) down.
+process.on('unhandledRejection', err => log('unhandled:', err?.message ?? err));
+process.on('uncaughtException', err => log('uncaught:', err?.stack ?? err));
 
 for (const signal of ['SIGINT', 'SIGTERM']) {
   process.on(signal, () => {
-    spare.close();
-    for (const c of conversations.values()) c.close();
+    for (const s of open.values()) s.stopProcess();
     process.exit(0);
   });
 }

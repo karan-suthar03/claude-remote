@@ -1,22 +1,28 @@
 package me.karansuthar.clauderemote
 
 import android.app.Application
-import me.karansuthar.clauderemote.claude.ServerLink
-import me.karansuthar.clauderemote.data.ConversationStore
+import me.karansuthar.clauderemote.bridge.BridgeClient
+import me.karansuthar.clauderemote.data.Device
+import me.karansuthar.clauderemote.data.DeviceStore
 import me.karansuthar.clauderemote.data.Settings
 
 class App : Application() {
-    val conversations by lazy { ConversationStore(this) }
-    val settings by lazy { Settings(this) }
+    val settings: Settings by lazy { Settings(this) }
+    val devices: DeviceStore by lazy { DeviceStore(this) }
 
-    private var link: ServerLink? = null
+    private val clients = HashMap<String, BridgeClient>()
 
-    /** The connection to the bridge set in Settings; null until an address is entered. */
+    /** The connection to [device]; created on first use and reused (recreated if its address changed). */
     @Synchronized
-    fun server(): ServerLink? {
-        val url = settings.serverUrl.ifEmpty { return null }
-        link?.takeIf { it.url == url }?.let { return it }
-        link?.close()
-        return ServerLink(url).also { link = it }
+    fun client(device: Device): BridgeClient {
+        clients[device.id]?.takeIf { it.url == device.url }?.let { return it }
+        clients.remove(device.id)?.shutdown()
+        return BridgeClient(device.url).also { clients[device.id] = it }
+    }
+
+    /** Closes and forgets a removed device's connection. */
+    @Synchronized
+    fun dropClient(deviceId: String) {
+        clients.remove(deviceId)?.shutdown()
     }
 }

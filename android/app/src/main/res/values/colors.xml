@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="ic_launcher_background">#D97757</color>
+    <!-- Window background behind Compose; matches the theme's background (dark in values-night). -->
+    <color name="app_background">#FAF9F7</color>
+</resources>

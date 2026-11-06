@@ -10,8 +10,8 @@ android {
 
     defaultConfig {
         applicationId = "me.karansuthar.clauderemote"
-        // Android 12+: the theme uses the phone's dynamic colors.
-        minSdk = 31
+        // Android 8+: covers phones still on Android 11 (e.g. Oppo Reno 6 as shipped).
+        minSdk = 26
         targetSdk = 36
         versionCode = 1
         versionName = "0.1"
@@ -19,7 +19,10 @@ android {
 
     buildTypes {
         release {
-            isMinifyEnabled = false
+            // R8 shrinks and optimises the code: Compose runs far smoother than in a debug build.
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
             // Sideloaded app: sign release with the debug key.
             signingConfig = signingConfigs.getByName("debug")
         }

@@ -1,3 +1,11 @@
 <resources>
-    <style name="Theme.ClaudeRemote" parent="android:Theme.Material.NoActionBar" />
+    <!-- Light window behind Compose until the first frame; values-night has the dark one. -->
+    <style name="Theme.ClaudeRemote" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">@color/app_background</item>
+        <item name="android:colorBackground">@color/app_background</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:windowSplashScreenBackground">@color/ic_launcher_background</item>
+    </style>
 </resources>
