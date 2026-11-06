@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The bridge is reached over Tailscale, whose WireGuard tunnel already encrypts the
+     traffic, so plain ws:// is allowed. Its address is whatever the user enters. -->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true" />
+</network-security-config>

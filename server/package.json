@@ -1,0 +1,17 @@
+{
+  "name": "claude-remote-server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Bridge from the phone to Claude Code on this machine (Claude Agent SDK, Pro login)",
+  "scripts": {
+    "start": "node index.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.3.284",
+    "ws": "^8.18.0"
+  }
+}

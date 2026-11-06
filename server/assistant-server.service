@@ -1,0 +1,20 @@
+[Unit]
+Description=Assistant server (phone <-> Claude Code bridge)
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+User=ubuntu
+WorkingDirectory=/opt/assistant-server
+# Claude Code reads the Pro login from ~/.claude of this user.
+Environment=HOME=/home/ubuntu
+Environment=PORT=8000
+# Skips Claude Code telemetry, update checks and other side requests:
+# about 200 ms off each turn in bench.mjs.
+Environment=CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+ExecStart=/usr/bin/node index.mjs
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
