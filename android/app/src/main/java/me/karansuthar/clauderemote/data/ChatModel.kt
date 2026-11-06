@@ -20,9 +20,15 @@ import org.json.JSONObject
  * (image/jpeg, png, gif or webp). Kept encoded; the UI decodes it only when it is shown.
  */
 @Immutable
-data class ChatImage(val mediaType: String, val data: String) {
+data class ChatImage(
+    val mediaType: String,
+    /** Base64 data; empty when the image came in a snapshot and must be fetched by [ref]. */
+    val data: String,
+    /** Set for images in snapshots: fetch the data with the bridge's "image" request. */
+    val ref: String? = null,
+) {
     /** A cheap content key (length plus a hash of samples), for caching decoded bitmaps. */
-    val cacheKey: String get() = imageKey(data)
+    val cacheKey: String get() = if (data.isEmpty() && ref != null) "ref:$ref" else imageKey(data)
 
     // The default would print megabytes of base64.
     override fun toString() = "ChatImage($mediaType, ${data.length} chars)"
@@ -50,8 +56,10 @@ fun parseImages(arr: JSONArray?): List<ChatImage> {
     if (arr == null || arr.length() == 0) return emptyList()
     return (0 until arr.length()).mapNotNull { i ->
         val o = arr.optJSONObject(i) ?: return@mapNotNull null
-        val data = o.stringOrNull("data")?.takeIf { it.isNotEmpty() } ?: return@mapNotNull null
-        ChatImage(o.stringOrNull("mediaType")?.takeIf { it.isNotEmpty() } ?: "image/png", data)
+        val data = o.stringOrNull("data").orEmpty()
+        val ref = o.stringOrNull("ref")?.takeIf { it.isNotEmpty() }
+        if (data.isEmpty() && ref == null) return@mapNotNull null
+        ChatImage(o.stringOrNull("mediaType")?.takeIf { it.isNotEmpty() } ?: "image/png", data, ref)
     }
 }
 
@@ -76,15 +84,16 @@ data class Step(
 )
 
 /**
- * A chat line: role is "user", "assistant" or "note". These classes are never mutated (every change
- * is a copy), so @Immutable lets Compose skip unchanged chat rows by equals() while a reply streams.
+ * One entry of the chat, in the order things happened (like Claude Code's own transcript):
+ * role is "user", "assistant" (reply text), "thinking", "step" (one tool call, in [step]) or
+ * "note". Never mutated (every change is a copy), so @Immutable lets Compose skip unchanged rows
+ * by equals() while a reply streams.
  */
 @Immutable
 data class ChatItem(
     val role: String,
     val text: String = "",
-    val thinking: String = "",
-    val steps: List<Step> = emptyList(),
+    val step: Step? = null,
     /** Images attached to a user message. */
     val images: List<ChatImage> = emptyList(),
 )
@@ -92,6 +101,8 @@ data class ChatItem(
 @Immutable
 data class ChatState(
     val items: List<ChatItem> = emptyList(),
+    /** Index of items[0] in the whole chat: this many earlier items can be loaded on request. */
+    val start: Int = 0,
     /** "running" or "idle". */
     val state: String = "idle",
     val title: String = "",
@@ -213,15 +224,17 @@ private fun parseStep(o: JSONObject) = Step(
 )
 
 fun parseItem(o: JSONObject): ChatItem {
-    val steps = o.optJSONArray("steps")
+    val role = o.stringOrNull("role") ?: "note"
     return ChatItem(
-        role = o.stringOrNull("role") ?: "note",
+        role = role,
         text = o.stringOrNull("text").orEmpty(),
-        thinking = o.stringOrNull("thinking").orEmpty(),
-        steps = if (steps == null) emptyList() else (0 until steps.length()).mapNotNull { steps.optJSONObject(it)?.let(::parseStep) },
-        images = parseImages(o.optJSONArray("images")),
+        step = if (role == "step") parseStep(o) else null,
+        images = if (role == "step") emptyList() else parseImages(o.optJSONArray("images")),
     )
 }
+
+fun parseItems(arr: JSONArray?): List<ChatItem> =
+    if (arr == null) emptyList() else (0 until arr.length()).mapNotNull { arr.optJSONObject(it)?.let(::parseItem) }
 
 /**
  * State from an attach reply: {session, items}. The bridge is the only source of truth, so this
@@ -229,9 +242,8 @@ fun parseItem(o: JSONObject): ChatItem {
  */
 fun snapshotState(reply: JSONObject): ChatState {
     val s = reply.optJSONObject("session")?.let(::parseSession)
-    val arr = reply.optJSONArray("items")
-    val items = if (arr == null) emptyList() else (0 until arr.length()).mapNotNull { arr.optJSONObject(it)?.let(::parseItem) }
-    val base = ChatState(items = items, loading = false)
+    val items = parseItems(reply.optJSONArray("items"))
+    val base = ChatState(items = items, start = reply.optInt("start", 0), loading = false)
     return if (s == null) base else base.withSession(s)
 }
 
@@ -256,43 +268,41 @@ private fun <T> List<T>.withLast(value: T): List<T> {
 
 private fun applyEvent(items: List<ChatItem>, e: JSONObject): List<ChatItem> {
     val last = items.lastOrNull()
-    // Changes the last item if it is an assistant reply, otherwise starts a new one.
-    fun withAssistant(change: (ChatItem) -> ChatItem): List<ChatItem> =
-        if (last?.role == "assistant") items.withLast(change(last))
-        else items + change(ChatItem("assistant"))
-
     val text = e.stringOrNull("text").orEmpty()
     return when (e.optString("k")) {
         "user" -> items + ChatItem("user", text, images = parseImages(e.optJSONArray("images")))
-        "text" -> withAssistant { it.copy(text = it.text + text) }
-        "thinking" -> withAssistant { it.copy(thinking = it.thinking + text) }
+        // Text and thinking extend the item before them only if it is the same kind; a tool step
+        // in between starts a new one, so the chat keeps Claude Code's order.
+        "text" -> if (last?.role == "assistant") items.withLast(last.copy(text = last.text + text)) else items + ChatItem("assistant", text)
+        "thinking" -> if (last?.role == "thinking") items.withLast(last.copy(text = last.text + text)) else items + ChatItem("thinking", text)
         "sep" ->
             if (last?.role == "assistant" && last.text.isNotEmpty() && !last.text.endsWith("\n\n"))
                 items.withLast(last.copy(text = last.text + "\n\n"))
             else items
-        "step" -> withAssistant {
-            it.copy(
-                steps = it.steps + Step(
-                    id = e.stringOrNull("id").orEmpty(),
-                    label = e.stringOrNull("label").orEmpty(),
-                    sub = e.optBoolean("sub"),
-                    name = e.stringOrNull("name").orEmpty(),
-                    detail = e.stringOrNull("detail").orEmpty(),
-                    detailLang = e.stringOrNull("detailLang").orEmpty(),
-                ),
-            )
-        }
+        "step" -> items + ChatItem(
+            "step",
+            step = Step(
+                id = e.stringOrNull("id").orEmpty(),
+                label = e.stringOrNull("label").orEmpty(),
+                sub = e.optBoolean("sub"),
+                name = e.stringOrNull("name").orEmpty(),
+                detail = e.stringOrNull("detail").orEmpty(),
+                detailLang = e.stringOrNull("detailLang").orEmpty(),
+            ),
+        )
         "stepDone" -> {
             val id = e.stringOrNull("id")
-            val error = e.optBoolean("error")
-            val output = e.stringOrNull("output").orEmpty()
-            val images = parseImages(e.optJSONArray("images"))
-            val index = items.indexOfLast { item -> item.steps.any { it.id == id } }
-            if (index < 0) items
+            val index = items.indexOfLast { it.step?.id == id }
+            if (index < 0) items   // its step is in an earlier page that isn't loaded
             else items.toMutableList().also { list ->
                 val item = list[index]
                 list[index] = item.copy(
-                    steps = item.steps.map { if (it.id == id) it.copy(done = true, error = error, output = output, images = images) else it },
+                    step = item.step!!.copy(
+                        done = true,
+                        error = e.optBoolean("error"),
+                        output = e.stringOrNull("output").orEmpty(),
+                        images = parseImages(e.optJSONArray("images")),
+                    ),
                 )
             }
         }
@@ -397,6 +407,37 @@ class ChatSession(
             onResult(ok)
         }
     }
+
+    private var loadingEarlier = false
+
+    /**
+     * Loads the page of items before the first one shown (long chats open with only the latest
+     * ones). Prepends them; live events keep appending at the end as before.
+     */
+    fun loadEarlier() {
+        val before = current.start
+        if (before <= 0 || loadingEarlier) return
+        loadingEarlier = true
+        scope.launch {
+            try {
+                val reply = client.request("history", JSONObject().put("key", key).put("before", before), heavy = true)
+                val older = parseItems(reply.optJSONArray("items"))
+                val start = reply.optInt("start", 0)
+                // Only if nothing replaced the state meanwhile (a reconnect brings a new snapshot).
+                if (current.start == before) update { it.copy(items = older + it.items, start = start) }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                update { it.copy(error = e.message ?: "Couldn't load earlier messages") }
+            } finally {
+                loadingEarlier = false
+            }
+        }
+    }
+
+    /** The base64 data of an image sent by reference in a snapshot. Throws on failure. */
+    suspend fun fetchImage(ref: String): String =
+        client.request("image", JSONObject().put("key", key).put("ref", ref), heavy = true).optString("data")
 
     /** The models the bridge offers. Throws on failure. */
     suspend fun models(): List<ModelInfo> = parseModels(client.request("models"))

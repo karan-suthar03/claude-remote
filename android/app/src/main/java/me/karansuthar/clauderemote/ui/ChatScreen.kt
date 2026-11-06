@@ -231,12 +231,16 @@ fun ChatScreen(app: App, device: Device, key: String, onBack: () -> Unit) {
                 if (state.loading && state.items.isEmpty()) {
                     CircularProgressIndicator(Modifier.align(Alignment.Center))
                 } else {
-                    MessageList(
-                        state.items,
-                        running = state.running && !state.closed,
-                        modifier = Modifier.fillMaxSize(),
-                        alwaysExpandSteps = alwaysExpandSteps,
-                    )
+                    androidx.compose.runtime.CompositionLocalProvider(LocalImageFetcher provides session::fetchImage) {
+                        MessageList(
+                            state.items,
+                            running = state.running && !state.closed,
+                            modifier = Modifier.fillMaxSize(),
+                            alwaysExpandSteps = alwaysExpandSteps,
+                            start = state.start,
+                            onLoadEarlier = session::loadEarlier,
+                        )
+                    }
                 }
             }
             InputBar(

@@ -123,8 +123,12 @@ private fun scaleToFit(b: Bitmap, maxPx: Int): Bitmap {
  * [image] decoded for display at up to [maxPx] on its long side: off the main thread, only while
  * composed (scrolling past cancels a queued decode), from the cache when it is there.
  */
+/** Fetches the data of an image sent by reference (snapshot history); provided by the chat screen. */
+val LocalImageFetcher = androidx.compose.runtime.staticCompositionLocalOf<(suspend (String) -> String)?> { null }
+
 @Composable
 private fun rememberImageLoad(image: ChatImage, maxPx: Int, cache: Boolean = true): ImageLoad {
+    val fetch = LocalImageFetcher.current
     val contentKey = remember(image) { image.cacheKey }
     val key = "$contentKey@$maxPx"
     val state = remember(key) {
@@ -134,7 +138,9 @@ private fun rememberImageLoad(image: ChatImage, maxPx: Int, cache: Boolean = tru
         if (state.value !is ImageLoad.Loading) return@LaunchedEffect
         state.value = try {
             val bitmap = withContext(decodeDispatcher) {
-                val b = decodeBase64Image(image.data, maxPx).asImageBitmap()
+                // History images arrive as references: download only when one is actually shown.
+                val data = if (image.data.isEmpty() && image.ref != null) (fetch ?: error("no fetcher"))(image.ref) else image.data
+                val b = decodeBase64Image(data, maxPx).asImageBitmap()
                 if (cache) bitmapCache.put(key, b)
                 aspectCache.put(contentKey, b.width.toFloat() / b.height)
                 b

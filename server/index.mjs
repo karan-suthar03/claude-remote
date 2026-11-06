@@ -14,7 +14,10 @@
      { t:"sessions" }                     -> { open:[Session], closed:[Session] }
      { t:"open", cwd } | { t:"open", resume, cwd? }
                                           -> { key }                          an open session's handle
-     { t:"attach", key }                  -> { session:Session, items:[Item] } then live { t:"ev", key, e }
+     { t:"attach", key }                  -> { session:Session, items:[Item], start } then live { t:"ev", key, e }
+                                          items: the latest SNAPSHOT_ITEMS; start: index of items[0]
+     { t:"history", key, before, limit? } -> { items:[Item], start }      earlier items (indexes < before)
+     { t:"image", key, ref }              -> { mediaType, data }           an image left out of a snapshot
      { t:"detach", key }
      { t:"send", key, text, images?:[{mediaType, data}], model?, effort? }
                                           images: base64 JPEG/PNG/GIF/WebP attached from the phone
@@ -34,11 +37,16 @@
             origin "terminal": a Claude Code session running in a terminal on this computer
             (found by its transcript being written in the last ACTIVE_MS). It is mirrored live
             from its transcript; sending a message continues it in the bridge seamlessly.
-   Item:    { role:"user"|"assistant"|"note", text, images?:[{mediaType, data}], thinking?,
-              steps?:[{id, name, label, detail, detailLang, sub, done, error, output}] }
-            detail: the call in full (command, diff, file content, JSON input); detailLang: "bash"|"diff"|"json"|""
+   Item (in the order they happened, like Claude Code's transcript):
+            { role:"user", text, images?:[{mediaType, data}] }
+            { role:"assistant", text }                 Markdown reply text
+            { role:"thinking", text }
+            { role:"step", id, name, label, detail, detailLang, sub, done, error, output, images? }
+            { role:"note", text }
+            detail: the call in full (command, diff, file content, JSON input); detailLang: "bash"|"diff"|"json"|ext|""
             output: the tool result as text (trimmed to OUTPUT_LIMIT), like `claude --verbose` shows
             images: images in the tool result (e.g. Read on a PNG), [{mediaType, data}]
+            In attach/history replies, images are sent as [{mediaType, ref}] and fetched with "image".
    Event e: { k:"user"|"text"|"thinking"|"sep"|"step"|"stepDone"|"note"|"state"|"meta", ... }
             applied to the items with the same rules on both sides (applyEvent).
    ============================================================== */
@@ -71,6 +79,8 @@ const CLAUDE_DIR = process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.cl
 const IMAGE_TYPES = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp']);
 const IMAGE_LIMIT = Number(process.env.IMAGE_LIMIT || 5 * 1024 * 1024);   // base64 chars per image
 const MAX_IMAGES = 10;
+// Long chats load in pages: the latest SNAPSHOT_ITEMS on attach, older ones on request.
+const SNAPSHOT_ITEMS = Number(process.env.SNAPSHOT_ITEMS || 150);
 // Tool output kept per step (characters); longer output keeps its start and end.
 const OUTPUT_LIMIT = Number(process.env.OUTPUT_LIMIT || 20_000);
 
@@ -98,28 +108,30 @@ function log(...args) {
    Chat items and events (mirrored in the app)
    --------------------------------------------------------------- */
 function applyEvent(items, e) {
+  // Items stay in the order things happened, like Claude Code's own transcript: text, thinking
+  // and each tool step are separate items, so a reply reads text -> command -> text -> ...
   const last = items[items.length - 1];
-  const assistant = () => {
-    if (last?.role === 'assistant') return last;
-    const item = { role: 'assistant', text: '', thinking: '', steps: [] };
-    items.push(item);
-    return item;
-  };
   switch (e.k) {
     case 'user': items.push({ role: 'user', text: e.text, ...(e.images?.length ? { images: e.images } : {}) }); break;
-    case 'text': assistant().text += e.text; break;
-    case 'thinking': assistant().thinking += e.text; break;
+    case 'text':
+      if (last?.role === 'assistant') last.text += e.text;
+      else items.push({ role: 'assistant', text: e.text });
+      break;
+    case 'thinking':
+      if (last?.role === 'thinking') last.text += e.text;
+      else items.push({ role: 'thinking', text: e.text });
+      break;
     case 'sep': if (last?.role === 'assistant' && last.text && !last.text.endsWith('\n\n')) last.text += '\n\n'; break;
     case 'step':
-      assistant().steps.push({
-        id: e.id, name: e.name ?? '', label: e.label, detail: e.detail ?? '', detailLang: e.detailLang ?? '',
+      items.push({
+        role: 'step', id: e.id, name: e.name ?? '', label: e.label, detail: e.detail ?? '', detailLang: e.detailLang ?? '',
         sub: !!e.sub, done: false, error: false, output: '',
       });
       break;
     case 'stepDone':
       for (let i = items.length - 1; i >= 0; i--) {
-        const s = items[i].steps?.find(st => st.id === e.id);
-        if (s) {
+        const s = items[i];
+        if (s.role === 'step' && s.id === e.id) {
           s.done = true; s.error = !!e.error; s.output = e.output ?? '';
           if (e.images?.length) s.images = e.images;
           break;
@@ -514,6 +526,20 @@ class Session {
 }
 
 /* ---------------------------------------------------------------
+   Snapshots: paged items, images by reference
+   --------------------------------------------------------------- */
+/** Items [from, to) of a session, with each image replaced by a reference the phone can fetch. */
+function itemsPage(session, from, to) {
+  const out = [];
+  for (let i = from; i < to; i++) {
+    const item = session.items[i];
+    if (!item.images?.length) { out.push(item); continue; }
+    out.push({ ...item, images: item.images.map((img, j) => ({ mediaType: img.mediaType, ref: `${i}:${j}` })) });
+  }
+  return out;
+}
+
+/* ---------------------------------------------------------------
    Registry
    --------------------------------------------------------------- */
 const open = new Map();   // key -> Session
@@ -664,7 +690,22 @@ async function models() {
   return result;
 }
 
+let usageCache = null;      // { at, value }
+let usageInFlight = null;
+/** Plan usage, answered from a cache (refreshed in the background) so the phone never waits seconds. */
 async function usage() {
+  const fresh = () => {
+    usageInFlight ??= usageNow().then(v => { usageCache = { at: Date.now(), value: v }; return v; }).finally(() => { usageInFlight = null; });
+    return usageInFlight;
+  };
+  if (usageCache) {
+    if (Date.now() - usageCache.at > 30_000) fresh().catch(() => {});
+    return usageCache.value;
+  }
+  return fresh();
+}
+
+async function usageNow() {
   const u = await withProbe(q => q.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET({ skipBehaviors: true }));
   const names = {
     five_hour: 'Current session (5 h)', seven_day: 'This week', seven_day_opus: 'This week (Opus)',
@@ -712,6 +753,7 @@ async function loginCode(code) {
   if (exit === 'timeout') { loginCancel(); throw new Error('Sign-in timed out. Start again.'); }
   login = null;
   modelCache = null;
+  usageCache = null;
   const acct = await account().catch(() => ({ loggedIn: false }));
   if (exit !== 0 || !acct.loggedIn) throw new Error(said.split('\n').pop() || 'Sign-in failed. Check the code and start again.');
   // Running sessions keep the old login until their process restarts.
@@ -732,7 +774,7 @@ function loginCancel() {
 async function handle(ws, msg) {
   switch (msg.t) {
     case 'info':
-      return { name: NAME, platform: process.platform, home: os.homedir(), sep: path.sep };
+      return { name: NAME, platform: process.platform, home: os.homedir(), sep: path.sep, protocol: 2 };
     case 'roots':
       return { roots: roots() };
     case 'ls':
@@ -767,7 +809,24 @@ async function handle(ws, msg) {
       if (!s && String(msg.key).startsWith('term:')) s = await openSession({ resume: String(msg.key).slice(5), key: msg.key });
       if (!s) throw new Error('This session is no longer open');
       s.watchers.add(ws);
-      return { session: s.info(), items: s.items };
+      const start = Math.max(0, s.items.length - SNAPSHOT_ITEMS);
+      return { session: s.info(), items: itemsPage(s, start, s.items.length), start };
+    }
+    case 'history': {
+      const s = open.get(msg.key);
+      if (!s) throw new Error('This session is no longer open');
+      const before = Math.max(0, Math.min(Number(msg.before) || 0, s.items.length));
+      const limit = Math.max(1, Math.min(Number(msg.limit) || SNAPSHOT_ITEMS, 500));
+      const start = Math.max(0, before - limit);
+      return { items: itemsPage(s, start, before), start };
+    }
+    case 'image': {
+      const s = open.get(msg.key);
+      if (!s) throw new Error('This session is no longer open');
+      const [i, j] = String(msg.ref ?? '').split(':').map(Number);
+      const img = s.items[i]?.images?.[j];
+      if (!img) throw new Error('Image not found');
+      return { mediaType: img.mediaType, data: img.data };
     }
     case 'detach':
       open.get(msg.key)?.watchers.delete(ws);
@@ -808,6 +867,7 @@ async function handle(ws, msg) {
       await runClaude(['auth', 'logout']);
       for (const s of open.values()) s.stopProcess();
       modelCache = null;
+      usageCache = null;
       return await account();
     }
     case 'interrupt':
@@ -881,6 +941,9 @@ server.on('error', err => {
 server.listen(PORT, HOST, () => {
   log(`claude-remote bridge "${NAME}" on ${HOST}:${PORT}`);
   log(`Add it in the app with the address ${HOST}${PORT === 8000 ? '' : `:${PORT}`}`);
+  // Warm the slow answers (each needs a Claude Code process) so the first phone doesn't wait.
+  models().catch(() => {});
+  usage().catch(() => {});
   account().then(a => log(a.loggedIn ? `Claude Code signed in as ${a.email ?? 'unknown'} (${a.plan ?? a.method ?? 'unknown plan'})` : 'Claude Code is NOT signed in: sign in from the app, or run `claude` here once')).catch(() => {});
 });
 

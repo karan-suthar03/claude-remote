@@ -102,12 +102,15 @@ fun MessageList(
     running: Boolean,
     modifier: Modifier = Modifier,
     alwaysExpandSteps: Boolean = true,
+    /** Index of items[0] in the whole chat; > 0 means earlier items can be loaded. */
+    start: Int = 0,
+    onLoadEarlier: () -> Unit = {},
 ) {
     val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
     val last = items.lastOrNull()
     // A "working" row at the end while running and no reply has started yet.
-    val showWorking = running && last?.role != "assistant"
+    val showWorking = running && last?.role != "assistant" && last?.role != "thinking"
     val count = items.size + if (showWorking) 1 else 0
     val threshold = with(LocalDensity.current) { 48.dp.roundToPx() }
     val nearBottom by remember(listState, threshold) {
@@ -130,8 +133,7 @@ fun MessageList(
     }
     LaunchedEffect(follow, nearBottom, count) { if (follow || nearBottom) seenCount = count }
 
-    val stepsDone = last?.steps?.count { it.done } ?: 0
-    LaunchedEffect(count, last?.text?.length, last?.thinking?.length, last?.steps?.size, stepsDone, running, follow) {
+    LaunchedEffect(count, last?.text?.length, last?.step?.done, running, follow) {
         if (!follow || count == 0) return@LaunchedEffect
         autoScrolling[0] = true
         try {
@@ -161,7 +163,13 @@ fun MessageList(
             // Items are only ever appended (a snapshot replaces the list), so the index is stable.
             // ChatItem is @Immutable and only the last item changes while streaming, so every
             // other row skips recomposition.
-            itemsIndexed(items, key = { index, _ -> index }, contentType = { _, item -> item.role }) { index, item ->
+            if (start > 0) item(key = "earlier", contentType = "earlier") {
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Center) {
+                    androidx.compose.material3.TextButton(onClick = onLoadEarlier) { Text("Load earlier messages ($start)") }
+                }
+            }
+            // Keyed by position in the whole chat, so loading earlier items keeps every key stable.
+            itemsIndexed(items, key = { index, _ -> start + index }, contentType = { _, item -> item.role }) { index, item ->
                 MessageBubble(
                     item,
                     live = running && index == items.lastIndex,
@@ -234,22 +242,20 @@ private fun MessageBubble(item: ChatItem, live: Boolean, running: Boolean, alway
                 }
             }
         }
-        "assistant" -> Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-            if (item.thinking.isNotEmpty()) {
-                ThinkingBlock(item.thinking, stillThinking = live && item.text.isEmpty() && item.steps.isEmpty())
-            } else if (live && item.text.isEmpty() && item.steps.isEmpty()) {
-                Working("Thinking…")
-            }
-            if (item.steps.isNotEmpty()) {
-                Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                    for (step in item.steps) {
-                        key(step.id) { StepView(step, sessionRunning = running, defaultExpanded = alwaysExpandSteps) }
-                    }
-                }
-            }
-            if (item.text.isNotBlank()) {
-                SelectionContainer { MarkdownText(item.text, Modifier.fillMaxWidth(), live = live) }
-            }
+        // Claude's reply text: the main thing to read, so full-strength text with a coral marker,
+        // while tool steps stay compact and dim, as in Claude Code's own transcript.
+        "assistant" -> if (item.text.isNotBlank()) Row(Modifier.fillMaxWidth()) {
+            Box(
+                Modifier
+                    .padding(top = 8.dp, end = 8.dp)
+                    .size(7.dp)
+                    .background(MaterialTheme.colorScheme.primary, androidx.compose.foundation.shape.CircleShape),
+            )
+            SelectionContainer(Modifier.weight(1f)) { MarkdownText(item.text, Modifier.fillMaxWidth(), live = live) }
+        }
+        "thinking" -> ThinkingBlock(item.text, stillThinking = live)
+        "step" -> item.step?.let { step ->
+            key(step.id) { StepView(step, sessionRunning = running, defaultExpanded = alwaysExpandSteps) }
         }
         else -> Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Center) {
             Surface(
