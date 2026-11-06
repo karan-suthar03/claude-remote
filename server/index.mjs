@@ -11,7 +11,10 @@
      { t:"info" }                         -> { name, platform, home, sep }
      { t:"roots" }                        -> { roots:[{name, path}] }        drives / filesystem roots
      { t:"ls", path }                     -> { path, parent, dirs:[{name, path}] }
-     { t:"sessions" }                     -> { open:[Session], closed:[Session] }
+     { t:"sessions", cwd? }               -> { open:[Session], closed:[Session] }
+                                          cwd: only that folder's sessions (closed up to FOLDER_LIMIT,
+                                          else CLOSED_LIMIT across all folders, symlinked project
+                                          directories included: see linked-projects.mjs)
      { t:"open", cwd } | { t:"open", resume, cwd? }
                                           -> { key }                          an open session's handle
      { t:"attach", key }                  -> { session:Session, items:[Item], start } then live { t:"ev", key, e }
@@ -70,7 +73,8 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { execFile, spawn } from 'node:child_process';
 import { createRequire } from 'node:module';
-import { getSessionMessages, listSessions, query } from '@anthropic-ai/claude-agent-sdk';
+import { getSessionInfo, getSessionMessages, query } from '@anthropic-ai/claude-agent-sdk';
+import { sessionsReply } from './session-list.mjs';
 import { WebSocketServer } from 'ws';
 
 const PORT = Number(process.env.PORT || 8000);
@@ -86,6 +90,8 @@ const DEFAULT_EFFORT = process.env.DEFAULT_EFFORT || null;
 const IDLE_PROCESS_MS = Number(process.env.IDLE_PROCESS_MS || 30 * 60_000);
 const SESSION_TTL_MS = Number(process.env.SESSION_TTL_MS || 24 * 3600_000);
 const CLOSED_LIMIT = Number(process.env.CLOSED_LIMIT || 50);
+// Saved sessions returned when the phone asks for one folder's sessions.
+const FOLDER_LIMIT = Number(process.env.FOLDER_LIMIT || 200);
 // A saved session whose transcript changed this recently is treated as running in a terminal.
 const ACTIVE_MS = Number(process.env.ACTIVE_MS || 2 * 60_000);
 const CLAUDE_DIR = process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude');
@@ -678,7 +684,8 @@ const touchedSince = (sessionId, mtime) => mtime > (releasedAt.get(sessionId) ??
 async function openSession({ cwd, resume, key }) {
   if (resume) {
     for (const s of open.values()) if (s.sessionId === resume) return s;
-    const info = (await listSessions({ limit: 1000 }).catch(() => [])).find(s => s.sessionId === resume);
+    const info = await getSessionInfo(resume, cwd ? { dir: cwd } : {}).catch(() => undefined)
+      ?? (cwd ? await getSessionInfo(resume).catch(() => undefined) : undefined);
     const dir = cwd || info?.cwd;
     if (!dir) throw new Error('Unknown session');
     const messages = await getSessionMessages(resume, { dir }).catch(() => []);
@@ -906,28 +913,13 @@ async function handle(ws, msg) {
       return { roots: roots() };
     case 'ls':
       return listDirs(String(msg.path || os.homedir()));
-    case 'sessions': {
-      const live = [...open.values()].map(s => s.info()).sort((a, b) => b.lastActive - a.lastActive);
-      const liveIds = new Set(live.map(s => s.sessionId).filter(Boolean));
-      const saved = await listSessions({ limit: CLOSED_LIMIT + liveIds.size }).catch(() => []);
-      // Sessions running in a terminal right now count as open, mirrored live on attach.
-      const now = Date.now();
-      for (const s of saved) {
-        if (liveIds.has(s.sessionId) || now - s.lastModified > ACTIVE_MS || !touchedSince(s.sessionId, s.lastModified)) continue;
-        live.push({
-          key: `term:${s.sessionId}`, sessionId: s.sessionId, cwd: s.cwd ?? '', title: s.customTitle || s.summary || s.firstPrompt || '',
-          state: now - s.lastModified < 8_000 ? 'running' : 'idle', lastActive: Math.min(now, s.lastModified),
-          model: null, effort: null, costUsd: 0, contextTokens: 0, background: 0, origin: 'terminal',
-        });
-        liveIds.add(s.sessionId);
-      }
-      live.sort((a, b) => b.lastActive - a.lastActive);
-      const closed = saved
-        .filter(s => !liveIds.has(s.sessionId))
-        .slice(0, CLOSED_LIMIT)
-        .map(s => ({ sessionId: s.sessionId, cwd: s.cwd ?? '', title: s.customTitle || s.summary || s.firstPrompt || '', state: 'idle', lastActive: s.lastModified }));
-      return { open: live, closed };
-    }
+    case 'sessions':
+      return sessionsReply({
+        live: [...open.values()].map(s => s.info()),
+        cwd: msg.cwd ? String(msg.cwd) : null,
+        limit: msg.cwd ? FOLDER_LIMIT : CLOSED_LIMIT,
+        activeMs: ACTIVE_MS, touchedSince, claudeDir: CLAUDE_DIR,
+      });
     case 'open':
       return { key: (await openSession({ cwd: msg.cwd, resume: msg.resume })).key };
     case 'attach': {

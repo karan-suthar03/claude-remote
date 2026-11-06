@@ -55,6 +55,7 @@ If you use Claude Code, paste this into it on the computer:
 - **Several computers.** Every computer running the bridge is a device in the app's side drawer, with a dot that shows whether it's connected.
 - **Device screen.** Shows the account Claude Code is signed in with, your plan's usage (5-hour and weekly limits, with reset times), and the open and closed sessions on that computer.
 - **New sessions in any folder.** A folder picker browses the computer's home folder and every drive (Windows) or `/` (macOS, Linux), with a filter box.
+  Inside a folder it also lists that folder's earlier sessions (from the phone or the terminal), so you can pick one up where you left off.
 - **Resume anything.** Closed sessions include ones started in a terminal with `claude`, and any of them can be reopened from the phone.
 - **Live chat.** Replies stream in as Markdown. Thinking can be expanded. Every tool call shows as a step: the command, diff, file contents or JSON input, and the tool's output, the way `claude --verbose` shows them. Subagent steps are indented.
 - **Model and effort picker** in each session. Changes apply right away, even mid-session, and you can save a choice as the default for new sessions.

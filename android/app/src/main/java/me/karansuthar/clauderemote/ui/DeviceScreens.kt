@@ -1,10 +1,7 @@
 package me.karansuthar.clauderemote.ui
 
-import android.text.format.DateUtils
-import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -59,7 +56,6 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.Immutable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -72,8 +68,6 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
-import androidx.compose.ui.hapticfeedback.HapticFeedbackType
-import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
@@ -100,7 +94,6 @@ import me.karansuthar.clauderemote.BuildConfig
 import me.karansuthar.clauderemote.data.Device
 import me.karansuthar.clauderemote.data.FoundDevice
 import me.karansuthar.clauderemote.data.normalizeServerUrl
-import org.json.JSONArray
 import org.json.JSONObject
 
 /** Closed sessions shown on the device screen (most recent first). */
@@ -625,37 +618,6 @@ fun SetupScreen(onAdd: () -> Unit) {
 
 // ---------------------------------------------------------------- device home
 
-@Immutable
-private data class SessionRow(
-    val key: String?,
-    val sessionId: String?,
-    val cwd: String,
-    val title: String,
-    val running: Boolean,
-    val lastActive: Long,
-    /** A Claude Code session running in a terminal on the computer, mirrored live. */
-    val terminal: Boolean = false,
-)
-
-private fun parseSessions(arr: JSONArray?): List<SessionRow> {
-    if (arr == null) return emptyList()
-    return (0 until arr.length()).mapNotNull { i ->
-        val o = arr.optJSONObject(i) ?: return@mapNotNull null
-        SessionRow(
-            key = o.optStringOrNull("key"),
-            sessionId = o.optStringOrNull("sessionId"),
-            cwd = o.optString("cwd"),
-            title = o.optString("title"),
-            running = o.optString("state") == "running",
-            lastActive = o.optLong("lastActive", 0L),
-            terminal = o.optString("origin") == "terminal",
-        )
-    }
-}
-
-private fun JSONObject.optStringOrNull(name: String): String? =
-    if (has(name) && !isNull(name)) optString(name).takeIf { it.isNotEmpty() } else null
-
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun DeviceHome(
@@ -807,10 +769,7 @@ fun DeviceHome(
         resuming = true
         scope.launch {
             try {
-                val reply = client.request("open", JSONObject().put("resume", sessionId).put("cwd", row.cwd))
-                val key = reply.optString("key")
-                if (key.isEmpty()) throw Exception("The computer didn't return a session.")
-                onOpenSession(key)
+                onOpenSession(client.resumeSession(sessionId, row.cwd))
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
@@ -1094,149 +1053,6 @@ internal fun StateMessage(icon: ImageVector, title: String, body: String, modifi
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 textAlign = TextAlign.Center,
             )
-        }
-    }
-}
-
-@Composable
-private fun StatusDot(running: Boolean, isOpen: Boolean) {
-    Box(Modifier.size(24.dp), contentAlignment = Alignment.Center) {
-        when {
-            running -> {
-                CircularProgressIndicator(
-                    Modifier.size(22.dp),
-                    strokeWidth = 2.dp,
-                    color = MaterialTheme.colorScheme.tertiary,
-                    trackColor = MaterialTheme.colorScheme.tertiaryContainer,
-                )
-                Box(Modifier.size(8.dp).background(MaterialTheme.colorScheme.tertiary, CircleShape))
-            }
-            isOpen -> Box(Modifier.size(10.dp).background(MaterialTheme.colorScheme.secondary, CircleShape))
-            else -> Box(Modifier.size(10.dp).background(MaterialTheme.colorScheme.outline, CircleShape))
-        }
-    }
-}
-
-@OptIn(ExperimentalFoundationApi::class)
-@Composable
-private fun SessionItem(row: SessionRow, isOpen: Boolean, onClick: () -> Unit, onClose: (() -> Unit)?) {
-    val haptics = LocalHapticFeedback.current
-    var menu by remember { mutableStateOf(false) }
-    val time = if (row.lastActive > 0) {
-        val now = System.currentTimeMillis()
-        // The computer's clock can run slightly ahead of the phone's: never show "in N minutes".
-        if (now - row.lastActive < DateUtils.MINUTE_IN_MILLIS) "Just now"
-        else DateUtils.getRelativeTimeSpanString(minOf(row.lastActive, now), now, DateUtils.MINUTE_IN_MILLIS).toString()
-    } else ""
-
-    Box(Modifier.padding(horizontal = 16.dp, vertical = 4.dp)) {
-        Surface(
-            color = MaterialTheme.colorScheme.surfaceContainer,
-            shape = MaterialTheme.shapes.medium,
-            modifier = Modifier.fillMaxWidth(),
-        ) {
-            Row(
-                Modifier
-                    .combinedClickable(
-                        onClick = onClick,
-                        onLongClick = if (onClose != null && row.key != null) {
-                            {
-                                haptics.performHapticFeedback(HapticFeedbackType.LongPress)
-                                menu = true
-                            }
-                        } else null,
-                        onLongClickLabel = if (onClose != null) "Session options" else null,
-                    )
-                    .padding(start = 12.dp, end = 16.dp, top = 12.dp, bottom = 12.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                StatusDot(running = isOpen && row.running, isOpen = isOpen)
-                Column(
-                    Modifier.weight(1f).padding(start = 12.dp, end = 8.dp),
-                    verticalArrangement = Arrangement.spacedBy(2.dp),
-                ) {
-                    Text(
-                        folderNameOf(row.cwd).ifBlank { "Unknown folder" },
-                        style = MaterialTheme.typography.titleSmall,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                    if (row.title.isNotBlank()) {
-                        Text(
-                            row.title,
-                            style = MaterialTheme.typography.bodyMedium,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                    }
-                    Text(
-                        row.cwd,
-                        style = MaterialTheme.typography.labelSmall,
-                        fontFamily = MonoFamily,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                }
-                Column(
-                    horizontalAlignment = Alignment.End,
-                    verticalArrangement = Arrangement.spacedBy(4.dp),
-                ) {
-                    if (isOpen) Row(
-                        horizontalArrangement = Arrangement.spacedBy(4.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        if (row.terminal) {
-                            Text(
-                                "Terminal",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.onTertiaryContainer,
-                                modifier = Modifier
-                                    .background(MaterialTheme.colorScheme.tertiaryContainer, MaterialTheme.shapes.extraSmall)
-                                    .padding(horizontal = 6.dp, vertical = 2.dp),
-                            )
-                        }
-                        Text(
-                            if (row.running) "Running" else "Idle",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = if (row.running) {
-                                MaterialTheme.colorScheme.onTertiaryContainer
-                            } else {
-                                MaterialTheme.colorScheme.onSecondaryContainer
-                            },
-                            modifier = Modifier
-                                .background(
-                                    if (row.running) {
-                                        MaterialTheme.colorScheme.tertiaryContainer
-                                    } else {
-                                        MaterialTheme.colorScheme.secondaryContainer
-                                    },
-                                    MaterialTheme.shapes.extraSmall,
-                                )
-                                .padding(horizontal = 6.dp, vertical = 2.dp),
-                        )
-                    }
-                    if (time.isNotEmpty()) {
-                        Text(
-                            time,
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    }
-                }
-            }
-        }
-        if (onClose != null) {
-            DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
-                DropdownMenuItem(
-                    text = { Text("Close session") },
-                    leadingIcon = { Icon(Icons.Default.Close, null) },
-                    onClick = {
-                        menu = false
-                        onClose()
-                    },
-                )
-            }
         }
     }
 }

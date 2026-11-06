@@ -137,8 +137,9 @@ private val BackStackSaver = listSaver<SnapshotStateList<String?>, String>(
 )
 
 /**
- * Picks a folder on the computer and opens a Claude Code session there. Folders and recent
- * folders are fetched live from the bridge on every visit; nothing is stored on the phone.
+ * Picks a folder on the computer and opens a Claude Code session there, or continues one of
+ * that folder's earlier sessions. Folders, recent folders and sessions are fetched live from
+ * the bridge on every visit; nothing is stored on the phone.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -159,6 +160,10 @@ fun FolderPicker(client: BridgeClient, onBack: () -> Unit, onOpened: (key: Strin
     var starting by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
     var filter by rememberSaveable(location) { mutableStateOf("") }
+    // The open folder's sessions, loaded alongside its subfolders.
+    var sessions by remember { mutableStateOf<FolderSessions>(FolderSessions.Loading) }
+    var sessionsReload by remember { mutableIntStateOf(0) }
+    var sessionsExpanded by rememberSaveable(location) { mutableStateOf(false) }
 
     fun navigate(to: String?) {
         if (to == location) return
@@ -193,7 +198,34 @@ fun FolderPicker(client: BridgeClient, onBack: () -> Unit, onOpened: (key: Strin
         }
     }
 
+    fun openSession(row: SessionRow) {
+        // Open ones (in the bridge or a terminal) attach directly; saved ones resume in this folder.
+        row.key?.let { onOpened(it); return }
+        val sessionId = row.sessionId ?: return
+        val folder = location ?: return
+        if (starting) return
+        starting = true
+        scope.launch {
+            try {
+                onOpened(client.resumeSession(sessionId, folder))
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                snackbar.showSnackbar(e.humanMessage("Couldn't resume the session."))
+            } finally {
+                starting = false
+            }
+        }
+    }
+
     BackHandler { goBack() }
+
+    // Separate from the listing so a slow session scan never holds up browsing.
+    LaunchedEffect(location, reloadKey, sessionsReload) {
+        val loc = location ?: return@LaunchedEffect
+        sessions = FolderSessions.Loading
+        sessions = loadFolderSessions(client, loc)
+    }
 
     LaunchedEffect(location, reloadKey) {
         val loc = location
@@ -430,6 +462,17 @@ fun FolderPicker(client: BridgeClient, onBack: () -> Unit, onOpened: (key: Strin
                                 }
                             }
                             item(key = "__divider") { HorizontalDivider() }
+                            // While filtering, only folders are shown: the query is a folder name.
+                            if (query.isEmpty()) {
+                                folderSessionItems(
+                                    state = sessions,
+                                    expanded = sessionsExpanded,
+                                    enabled = !starting,
+                                    onExpand = { sessionsExpanded = true },
+                                    onRetry = { sessionsReload++ },
+                                    onOpen = ::openSession,
+                                )
+                            }
                             if (dirs.isEmpty()) {
                                 item(key = "__empty") {
                                     Row(
