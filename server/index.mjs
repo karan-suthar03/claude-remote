@@ -65,8 +65,9 @@ const PORT = Number(process.env.PORT || 8000);
 // its own and Claude Code can do anything here, so it must not be reachable from the LAN.
 const HOST = process.env.HOST || tailscaleAddress();
 const NAME = process.env.BRIDGE_NAME || os.hostname();
-const DEFAULT_MODEL = process.env.DEFAULT_MODEL || 'sonnet';
-const DEFAULT_EFFORT = process.env.DEFAULT_EFFORT || 'medium';
+// Unset: Claude Code's own default model and effort (its settings), exactly as in a terminal.
+const DEFAULT_MODEL = process.env.DEFAULT_MODEL || null;
+const DEFAULT_EFFORT = process.env.DEFAULT_EFFORT || null;
 // An idle session's process is stopped after this long; the session stays open and
 // resumes on the next message. Open sessions untouched for SESSION_TTL_MS are closed.
 const IDLE_PROCESS_MS = Number(process.env.IDLE_PROCESS_MS || 30 * 60_000);
@@ -287,7 +288,7 @@ class Session {
   info() {
     return {
       key: this.key, sessionId: this.sessionId, cwd: this.cwd, title: this.title || path.basename(this.cwd) || this.cwd,
-      state: this.state, lastActive: this.lastActive, model: this.model, effort: this.effort,
+      state: this.state, lastActive: this.lastActive, model: this.model ?? 'default', effort: this.effort,
       costUsd: this.costUsd, contextTokens: this.contextTokens, background: this.background,
       origin: this.origin,
     };
@@ -363,8 +364,8 @@ class Session {
     const q = query({
       prompt: input,
       options: {
-        model: this.model,
-        effort: this.effort,
+        ...(this.model ? { model: this.model } : {}),
+        ...(this.effort ? { effort: this.effort } : {}),
         thinking: { type: 'adaptive', display: 'summarized' },
         // Plain Claude Code: its own prompt and tools, plus this computer's and the folder's
         // settings and CLAUDE.md, exactly like running `claude` in that folder.
