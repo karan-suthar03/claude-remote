@@ -119,12 +119,30 @@ data class ChatState(
     val contextTokens: Int = 0,
     /** Background tasks running right now. */
     val background: Int = 0,
+    val tasks: List<BgTask> = emptyList(),
     /** "bridge", or "terminal": a Claude Code session running in a terminal on the computer, mirrored live. */
     val origin: String = ORIGIN_BRIDGE,
+    /** When the current turn started, on this phone's clock (0 = not running). */
+    val turnStartedAt: Long = 0,
+    /** Output tokens of the current turn so far. */
+    val turnTokens: Int = 0,
 ) {
     val running: Boolean get() = state == "running"
     val isTerminal: Boolean get() = origin == ORIGIN_TERMINAL
 }
+
+/** A background task of a session: a backgrounded command, a background subagent, a monitor. */
+@Immutable
+data class BgTask(val id: String, val type: String, val description: String, val agent: String?) {
+    val isAgent: Boolean get() = agent != null || type.contains("agent")
+}
+
+private fun parseTasks(arr: JSONArray?): List<BgTask> =
+    if (arr == null) emptyList() else (0 until arr.length()).mapNotNull { i ->
+        val o = arr.optJSONObject(i) ?: return@mapNotNull null
+        val id = o.stringOrNull("id") ?: return@mapNotNull null
+        BgTask(id, o.stringOrNull("type").orEmpty(), o.stringOrNull("description").orEmpty(), o.stringOrNull("agent"))
+    }
 
 const val ORIGIN_BRIDGE = "bridge"
 const val ORIGIN_TERMINAL = "terminal"
@@ -143,8 +161,12 @@ data class SessionInfo(
     val costUsd: Double = 0.0,
     val contextTokens: Int = 0,
     val background: Int = 0,
+    val tasks: List<BgTask> = emptyList(),
     /** "bridge" or "terminal" (see [ChatState.origin]). */
     val origin: String = ORIGIN_BRIDGE,
+    /** How long the current turn had run when the bridge sent this, and its output tokens. */
+    val turnMs: Long = 0,
+    val turnTokens: Int = 0,
 ) {
     val running: Boolean get() = state == "running"
 }
@@ -165,7 +187,10 @@ fun parseSession(o: JSONObject) = SessionInfo(
     costUsd = o.optDouble("costUsd", 0.0).takeIf { !it.isNaN() } ?: 0.0,
     contextTokens = o.optInt("contextTokens"),
     background = o.optInt("background"),
+    tasks = parseTasks(o.optJSONArray("tasks")),
     origin = o.stringOrNull("origin")?.takeIf { it.isNotEmpty() } ?: ORIGIN_BRIDGE,
+    turnMs = o.optLong("turnMs"),
+    turnTokens = o.optInt("turnTokens"),
 )
 
 /** A model the bridge offers: [value] is what set_model takes; [efforts] may be empty. */
@@ -204,7 +229,16 @@ fun ChatState.withSession(s: SessionInfo) = copy(
     costUsd = s.costUsd,
     contextTokens = s.contextTokens,
     background = s.background,
+    tasks = s.tasks,
     origin = s.origin,
+    // The bridge's elapsed time, turned into a start on this phone's clock (the clocks may differ).
+    turnStartedAt = when {
+        !s.running -> 0
+        s.turnMs > 0 -> System.currentTimeMillis() - s.turnMs
+        turnStartedAt > 0 -> turnStartedAt
+        else -> System.currentTimeMillis()
+    },
+    turnTokens = if (s.running) s.turnTokens else 0,
 )
 
 fun parseSessions(arr: JSONArray?): List<SessionInfo> =
@@ -249,7 +283,14 @@ fun snapshotState(reply: JSONObject): ChatState {
 
 /** Applies one live event; the same rules as the bridge's applyEvent. */
 fun ChatState.reduce(e: JSONObject): ChatState = when (e.optString("k")) {
-    "state" -> copy(state = e.stringOrNull("state") ?: state)
+    "state" -> {
+        val next = e.stringOrNull("state") ?: state
+        when {
+            next == "running" && !running -> copy(state = next, turnStartedAt = System.currentTimeMillis(), turnTokens = 0)
+            next != "running" -> copy(state = next, turnStartedAt = 0, turnTokens = 0)
+            else -> copy(state = next)
+        }
+    }
     "meta" -> {
         val s = e.optJSONObject("session")
         // Newer bridges send the whole session; older ones only {sessionId}.
@@ -455,6 +496,24 @@ class ChatSession(
     }
 
     fun interrupt() = client.post("interrupt", JSONObject().put("key", key))
+
+    /**
+     * Like Ctrl+B: moves running commands and subagents to the background, or only the one started by
+     * the step [toolUseId]. False if nothing was running in the foreground.
+     */
+    /** The end (last 8 KB) of a background command's output: {output, totalBytes, truncated}. */
+    suspend fun taskOutput(taskId: String): JSONObject =
+        client.request("task_output", JSONObject().put("key", key).put("taskId", taskId))
+
+    suspend fun stopTask(taskId: String) {
+        client.request("stop_task", JSONObject().put("key", key).put("taskId", taskId))
+    }
+
+    suspend fun background(toolUseId: String? = null): Boolean {
+        val fields = JSONObject().put("key", key)
+        if (toolUseId != null) fields.put("toolUseId", toolUseId)
+        return client.request("background", fields).optBoolean("ok")
+    }
 
     /** Ends the Claude Code process; the session becomes a closed one. */
     fun close() {

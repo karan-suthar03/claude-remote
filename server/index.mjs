@@ -22,6 +22,12 @@
      { t:"send", key, text, images?:[{mediaType, data}], model?, effort? }
                                           images: base64 JPEG/PNG/GIF/WebP attached from the phone
      { t:"interrupt", key }
+     { t:"background", key, toolUseId? } -> { ok }   like Ctrl+B: running Bash commands and subagents
+                                          (or just the one toolUseId started) move to the background;
+                                          ok false when nothing was running in the foreground
+     { t:"task_output", key, taskId }     -> { output, totalBytes, truncated }   a background shell
+                                          task's output: the last 8 KB (Session.tasks lists them)
+     { t:"stop_task", key, taskId }       stops one background task
      { t:"close", key }                   ends the Claude Code process; the session becomes closed
      { t:"set_model", key, model?, effort? }   -> { session }   applied live
      { t:"models" }                       -> { models:[{value, displayName, description, efforts}] }
@@ -30,10 +36,17 @@
      { t:"login_start", console? }        -> { url }                 sign-in link to open on the phone
      { t:"login_code", code }             -> { ok, account }         the code the sign-in page shows
      { t:"login_cancel" } / { t:"logout" }
+     { t:"peers" }                        -> { peers:[{name, host, address, url}] }
+                                          other computers on this tailnet running the bridge
+                                          (online peers from `tailscale status` that answer GET /)
    Errors: { t:"error", id, message }. Pushed: { t:"ev", key, e }, { t:"closed", key }.
 
    Session: { key?, sessionId, cwd, title, state:"running"|"idle", lastActive, model, effort,
-              costUsd, contextTokens, background, origin:"bridge"|"terminal" }
+              costUsd, contextTokens, background, origin:"bridge"|"terminal", turnMs, turnTokens }
+            tasks: background tasks running now, [{id, type, description, agent}]
+            (type e.g. "local_bash", "local_agent"; agent: the subagent type)
+            turnMs: how long the current turn has run (0 when idle); turnTokens: its output tokens
+            so far (estimated while a message streams). Pushed in meta about once a second.
             origin "terminal": a Claude Code session running in a terminal on this computer
             (found by its transcript being written in the last ACTIVE_MS). It is mirrored live
             from its transcript; sending a message continues it in the bridge seamlessly.
@@ -55,7 +68,7 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { spawn } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { getSessionMessages, listSessions, query } from '@anthropic-ai/claude-agent-sdk';
 import { WebSocketServer } from 'ws';
@@ -99,6 +112,63 @@ function tailscaleAddress() {
     }
   }
   return null;
+}
+
+/** The tailscale CLI: on PATH, or where the Windows and macOS apps install it. */
+function tailscaleBin() {
+  const known = process.platform === 'win32'
+    ? [path.join(process.env.ProgramFiles || 'C:\Program Files', 'Tailscale', 'tailscale.exe')]
+    : process.platform === 'darwin' ? ['/Applications/Tailscale.app/Contents/MacOS/Tailscale'] : [];
+  return known.find(f => fs.existsSync(f)) || 'tailscale';
+}
+
+/** GET / on host:port; the bridge's health reply, or null if it isn't a bridge. */
+function probeBridge(host, port, timeoutMs = 2500) {
+  return new Promise(resolve => {
+    const req = http.get({ host, port, path: '/', timeout: timeoutMs }, res => {
+      let body = '';
+      res.setEncoding('utf8');
+      res.on('data', d => { body += d; if (body.length > 4096) req.destroy(); });
+      res.on('end', () => {
+        try { const j = JSON.parse(body); resolve(j?.service === 'claude-remote' ? j : null); } catch { resolve(null); }
+      });
+    });
+    req.on('timeout', () => req.destroy());
+    req.on('error', () => resolve(null));
+  });
+}
+
+// Ports to look for other bridges on: 8000-8010, this bridge's own, and any in PEER_PORTS ("8020,9000").
+const PEER_PORTS = [...new Set([
+  ...Array.from({ length: 11 }, (_, i) => 8000 + i), PORT,
+  ...String(process.env.PEER_PORTS || '').split(',').map(Number).filter(n => n > 0 && n < 65536),
+])];
+let peersCache = null;   // { at, peers }
+const PEERS_TTL_MS = 30_000;
+
+/** Other computers on this tailnet running the bridge, for the app to offer to add. */
+async function peers() {
+  if (peersCache && Date.now() - peersCache.at < PEERS_TTL_MS) return peersCache.peers;
+  const status = await new Promise((resolve, reject) => {
+    execFile(tailscaleBin(), ['status', '--json'], { timeout: 10_000, maxBuffer: 16 * 1024 * 1024, windowsHide: true }, (err, out) => {
+      if (err) return reject(new Error('Could not ask Tailscale for the other devices on this tailnet'));
+      try { resolve(JSON.parse(out)); } catch { reject(new Error('Unexpected reply from Tailscale')); }
+    });
+  });
+  const ports = PEER_PORTS;
+  const candidates = Object.values(status.Peer ?? {})
+    .filter(p => p.Online && !['android', 'iOS'].includes(p.OS))
+    .map(p => ({ ip: (p.TailscaleIPs ?? []).find(a => a.includes('.')), host: p.HostName }))
+    .filter(p => p.ip && p.ip !== HOST);
+  const found = await Promise.all(candidates.flatMap(c => ports.map(async port => {
+    const health = await probeBridge(c.ip, port);
+    if (!health) return null;
+    const address = port === 8000 ? c.ip : `${c.ip}:${port}`;
+    return { name: health.name || c.host, host: c.host, address, url: `ws://${c.ip}:${port}/ws` };
+  })));
+  const list = found.filter(Boolean).sort((a, b) => a.name.localeCompare(b.name));
+  peersCache = { at: Date.now(), peers: list };
+  return list;
 }
 
 function log(...args) {
@@ -280,6 +350,13 @@ class Session {
     this.costUsd = 0;
     this.contextTokens = 0;
     this.background = 0;         // live background tasks
+    this.tasks = [];             // and what they are: [{id, type, description, agent}]
+    // The current turn, for the phone's "Working… (1m 20s · ↓ 3.2k tokens)" line.
+    this.turnStart = 0;          // when the session last started running
+    this.turnTokens = 0;         // output tokens of the turn's finished messages
+    this.msgTokens = 0;          // the message being written: estimated, then the API's count
+    this.msgChars = 0;
+    this.tokensPushed = 0;       // when the token count was last pushed to phones
     this.watchers = new Set();   // sockets attached to this session
     this.q = null;
     this.box = null;
@@ -290,7 +367,9 @@ class Session {
       key: this.key, sessionId: this.sessionId, cwd: this.cwd, title: this.title || path.basename(this.cwd) || this.cwd,
       state: this.state, lastActive: this.lastActive, model: this.model ?? 'default', effort: this.effort,
       costUsd: this.costUsd, contextTokens: this.contextTokens, background: this.background,
-      origin: this.origin,
+      tasks: this.tasks, origin: this.origin,
+      turnMs: this.state === 'running' && this.turnStart ? Date.now() - this.turnStart : 0,
+      turnTokens: this.turnTokens + this.msgTokens,
     };
   }
 
@@ -341,6 +420,13 @@ class Session {
     if (this.tail) { clearInterval(this.tail.timer); this.tail = null; }
   }
 
+  /** The turn's token count changed: pushed at most once a second (or now, when [now]). */
+  pushTokens(now = false) {
+    if (!now && Date.now() - this.tokensPushed < 1000) return;
+    this.tokensPushed = Date.now();
+    this.meta();
+  }
+
   /** Pushes the session's changing fields (model, cost, context, background tasks) to attached phones. */
   meta() {
     this.emit({ k: 'meta', session: this.info() });
@@ -348,6 +434,10 @@ class Session {
 
   setState(state) {
     if (state === this.state) return;
+    if (state === 'running') {
+      this.turnStart = Date.now();
+      this.turnTokens = this.msgTokens = this.msgChars = 0;
+    }
     this.state = state;
     this.emit({ k: 'state', state });
   }
@@ -377,6 +467,8 @@ class Session {
         // Nobody can answer its multiple-choice prompt yet; Claude asks in plain text instead.
         disallowedTools: ['AskUserQuestion'],
         includePartialMessages: true,
+        // The phone stops background tasks one at a time, so Stop only ends the turn (like Esc).
+        perTaskStopAffordance: true,
         // Stream subagents' own steps too, so the phone shows them nested under their Agent step.
         forwardSubagentText: true,
         cwd: this.cwd,
@@ -389,7 +481,7 @@ class Session {
       log(`session ${this.key.slice(0, 8)} failed:`, err.message);
       this.emit({ k: 'note', text: `Claude Code stopped: ${err.message}` });
     }).finally(() => {
-      if (this.q === q) { this.q = null; this.box = null; this.background = 0; }
+      if (this.q === q) { this.q = null; this.box = null; this.background = 0; this.tasks = []; }
       this.setState('idle');
     });
   }
@@ -410,10 +502,20 @@ class Session {
         case 'stream_event': {
           if (sub) break;
           const ev = msg.event;
-          if (ev?.type === 'message_start') this.emit({ k: 'sep' });
-          else if (ev?.type === 'content_block_delta') {
+          if (ev?.type === 'message_start') {
+            this.emit({ k: 'sep' });
+            this.turnTokens += this.msgTokens;
+            this.msgTokens = this.msgChars = 0;
+          } else if (ev?.type === 'content_block_delta') {
             if (ev.delta?.type === 'text_delta' && ev.delta.text) this.emit({ k: 'text', text: ev.delta.text });
             else if (ev.delta?.type === 'thinking_delta' && ev.delta.thinking) this.emit({ k: 'thinking', text: ev.delta.thinking });
+            // About 4 characters a token until the message's real count arrives.
+            this.msgChars += (ev.delta?.text ?? ev.delta?.thinking ?? ev.delta?.partial_json ?? '').length;
+            this.msgTokens = Math.round(this.msgChars / 4);
+            this.pushTokens();
+          } else if (ev?.type === 'message_delta' && ev.usage?.output_tokens != null) {
+            this.msgTokens = ev.usage.output_tokens;
+            this.pushTokens(true);
           }
           break;
         }
@@ -459,7 +561,13 @@ class Session {
           break;
         case 'system':
           if (msg.subtype === 'session_state_changed') this.setState(msg.state === 'idle' ? 'idle' : 'running');
-          else if (msg.subtype === 'background_tasks_changed') { this.background = (msg.tasks ?? []).length; this.meta(); }
+          else if (msg.subtype === 'background_tasks_changed') {
+            this.tasks = (msg.tasks ?? []).filter(t => !t.ambient).map(t => ({
+              id: t.task_id, type: t.task_type, description: t.description ?? '', agent: t.subagent_type ?? null,
+            }));
+            this.background = this.tasks.length;
+            this.meta();
+          }
           else if (msg.subtype === 'compact_boundary') this.emit({ k: 'note', text: 'Conversation compacted to free up context' });
           else if (/^task_/.test(msg.subtype ?? '')) {
             const text = msg.summary || msg.description || msg.status;
@@ -509,6 +617,24 @@ class Session {
     if (model) { if (this.q) await this.q.setModel(model).catch(() => {}); this.model = model; }
     if (effort) { if (this.q) await this.q.applyFlagSettings({ effortLevel: effort }).catch(() => {}); this.effort = effort; }
     this.meta();
+  }
+
+  /** The end of a background shell task's output (the last 8 KB), like /tasks in the terminal. */
+  async taskOutput(taskId) {
+    if (!this.q) throw new Error('This session has no running process');
+    const r = await this.q.getTaskOutput(taskId);
+    return { output: r?.output ?? '', totalBytes: r?.total_bytes ?? 0, truncated: !!r?.truncated };
+  }
+
+  async stopTask(taskId) {
+    if (!this.q) throw new Error('This session has no running process');
+    await this.q.stopTask(taskId);
+  }
+
+  /** Moves running Bash commands and subagents to the background, like Ctrl+B in the terminal. */
+  async moveToBackground(toolUseId) {
+    if (!this.q || this.state !== 'running') return false;
+    return !!(await this.q.backgroundTasks(toolUseId || undefined));
   }
 
   interrupt() {
@@ -870,6 +996,24 @@ async function handle(ws, msg) {
       modelCache = null;
       usageCache = null;
       return await account();
+    }
+    case 'peers':
+      return { peers: await peers() };
+    case 'task_output': {
+      const s = open.get(msg.key);
+      if (!s) throw new Error('This session is no longer open');
+      return await s.taskOutput(String(msg.taskId ?? ''));
+    }
+    case 'stop_task': {
+      const s = open.get(msg.key);
+      if (!s) throw new Error('This session is no longer open');
+      await s.stopTask(String(msg.taskId ?? ''));
+      return {};
+    }
+    case 'background': {
+      const s = open.get(msg.key);
+      if (!s) throw new Error('This session is no longer open');
+      return { ok: await s.moveToBackground(typeof msg.toolUseId === 'string' ? msg.toolUseId : undefined) };
     }
     case 'interrupt':
       open.get(msg.key)?.interrupt();

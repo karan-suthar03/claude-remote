@@ -27,6 +27,7 @@ Node 20 or newer is required. For autostart, see the table in the README's setup
 | `SESSION_TTL_MS` | `86400000` (24 h) | How long an open session can go without activity before it is closed. It moves to the closed list. |
 | `CLOSED_LIMIT` | `50` | Maximum number of closed (saved) sessions returned by `sessions`. |
 | `ACTIVE_MS` | `120000` | A saved session whose transcript was written this recently (and not by the bridge) is listed as open, as a session running in a terminal. |
+| `PEER_PORTS` | (none) | Extra ports, comma-separated, to look for other bridges on for `peers`. Ports 8000–8010 and this bridge's own `PORT` are always checked. |
 | `IMAGE_LIMIT` | `5242880` | Maximum base64 characters per image (about 3.7 MB of image). Up to 10 images per message. |
 | `OUTPUT_LIMIT` | `20000` | Maximum characters kept for each step's `detail` and `output`. Longer text keeps its start and end, with a `… N characters not shown …` marker between them. |
 
@@ -89,6 +90,9 @@ On failure, the reply is `{ t:"error", id, message }`. A frame that isn't valid 
 | `{ t:"detach", key }` | `{}` | Stops this socket's live events for that session. |
 | `{ t:"send", key, text, images?, model?, effort? }` | `{}` | Sends a user message. `images`: up to 10 `{ mediaType, data }` (base64 JPEG, PNG, GIF or WebP); `text` may be empty when images are sent. Sending to a terminal session continues it in the bridge. Starts the process if needed. A new `model` or `effort` is applied first. The reply comes as soon as the message is queued, and the chat arrives as events. |
 | `{ t:"interrupt", key }` | `{}` | Interrupts the current turn, like Esc in the terminal. |
+| `{ t:"task_output", key, taskId }` | `{ output, totalBytes, truncated }` | The end (last 8 KB) of a background shell task's output, like `/tasks` in the terminal. `taskId` from the session's `tasks`. |
+| `{ t:"stop_task", key, taskId }` | `{}` | Stops one background task. The bridge declares per-task stop, so the stop button (`interrupt`) ends only the turn and leaves background tasks running. |
+| `{ t:"background", key, toolUseId? }` | `{ ok }` | Like Ctrl+B in the terminal: running Bash commands and subagents move to the background and the turn carries on; each one reports back when it finishes. With `toolUseId`, only the task that tool call started. `ok` is false when nothing was running in the foreground. |
 | `{ t:"close", key }` | `{}` | Ends the Claude Code process and removes the session from `open`. Attached sockets get `{ t:"closed", key }`. The transcript stays on disk, so the session shows in `closed` and can be resumed. |
 | `{ t:"set_model", key, model?, effort? }` | `{ session:Session }` | Changes the model and/or effort. If the process is running, the change applies to it right away. |
 | `{ t:"models" }` | `{ models:[{ value, displayName, description, efforts }] }` | The models this login can use, with their supported effort levels. Cached for 10 minutes. |
@@ -97,6 +101,7 @@ On failure, the reply is `{ t:"error", id, message }`. A frame that isn't valid 
 | `{ t:"login_start", console? }` | `{ url }` | Starts a sign-in (see [Login](#login)). `console:true` signs in with an Anthropic Console account instead of a Claude subscription. |
 | `{ t:"login_code", code }` | `{ ok, account }` | Finishes the sign-in with the code shown on the sign-in page. Can take up to 60 seconds. |
 | `{ t:"login_cancel" }` | `{}` | Abandons a sign-in in progress. |
+| `{ t:"peers" }` | `{ peers:[{ name, host, address, url }] }` | Other computers on this tailnet running the bridge, so the app can offer them under **Available to add**. Asks `tailscale status --json` for online peers (phones skipped), then checks each one's ports 8000–8010, `PORT` and `PEER_PORTS` for the bridge's health reply. `name`: that bridge's `BRIDGE_NAME`; `host`: its Tailscale hostname; `url`: `ws://ip:port/ws`. Cached for 30 seconds. |
 | `{ t:"logout" }` | `{ loggedIn, email, org, plan, method }` | Runs `claude auth logout` and stops every session's process. |
 
 `model` must look like a model id or alias (`[\w.:\[\]-]`, at most 80 characters). `effort` must be one of `low`, `medium`, `high`, `xhigh`, `max`. Invalid values are ignored.
@@ -124,7 +129,10 @@ On failure, the reply is `{ t:"error", id, message }`. A frame that isn't valid 
   costUsd,        // total cost of this process so far (open sessions only)
   contextTokens,  // input + cache tokens of the last turn, i.e. current context size
   background,     // background tasks running right now
+  tasks,          // and which: [{ id, type, description, agent }] (type e.g. "local_bash", "local_agent")
   origin,         // "bridge" | "terminal" (running in a terminal, mirrored live)
+  turnMs,         // how long the current turn has been running (0 when idle)
+  turnTokens,     // output tokens of the current turn so far (estimated while a message streams)
 }
 ```
 
@@ -179,7 +187,7 @@ Claude Code sessions you run in a terminal on the computer show up in the app to
 
 - **Detected** when their transcript (`~/.claude/projects/<folder>/<sessionId>.jsonl`) was written in the last `ACTIVE_MS`, and not by the bridge itself. They are listed under **Open** with `origin:"terminal"`, `running` while the transcript changed in the last 8 seconds.
 - **Mirrored live.** Attaching loads the transcript, then the bridge follows the file every second and turns each new entry into the same events as a bridge session. The phone watches the terminal work as it happens.
-- **Continued from the phone.** Sending a message stops the mirror and resumes the session in the bridge (same session id), with a note in the chat. The terminal's own copy doesn't see those messages; quit it there, or continue with `claude --resume` later to pick up everything.
+- **Continued from the phone.** Sending a message stops the mirror and resumes the session in the bridge (same session id), with a note in the chat. The terminal's own copy doesn't see those messages; quit it there, or continue with `claude --resume` later to pick up everything. **Exit Claude Code in the terminal before sending from the phone**: if both keep going they write to the same session and the conversation gets mixed up. The app says so on a terminal session and asks before its first message.
 - A mirror nobody watches is dropped once the terminal has been quiet for `ACTIVE_MS`; the session then appears under **closed**.
 
 ## Session lifecycle

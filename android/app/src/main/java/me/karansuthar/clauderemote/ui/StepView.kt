@@ -8,6 +8,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -51,8 +52,12 @@ fun StepView(
     expanded: Boolean,
     onToggle: () -> Unit,
     modifier: Modifier = Modifier,
+    /** Set while this step's command or subagent can be moved to the background (Ctrl+B). */
+    onBackground: (() -> Unit)? = null,
 ) {
     val cs = MaterialTheme.colorScheme
+    val canBackground = onBackground != null && sessionRunning && !step.done &&
+        step.name in BACKGROUNDABLE && !step.label.startsWith("Background:")
     val lineColor = cs.outlineVariant
     val outer = if (step.sub) {
         modifier
@@ -87,6 +92,13 @@ fun StepView(
                 overflow = TextOverflow.Ellipsis,
                 modifier = Modifier.weight(1f),
             )
+            if (canBackground) {
+                androidx.compose.material3.TextButton(
+                    onClick = { onBackground?.invoke() },
+                    contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 8.dp, vertical = 0.dp),
+                    modifier = Modifier.height(28.dp),
+                ) { Text("Background", style = MaterialTheme.typography.labelMedium) }
+            }
             Icon(
                 if (expanded) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
                 contentDescription = if (expanded) "Collapse" else "Expand",
@@ -97,6 +109,9 @@ fun StepView(
         if (expanded) StepDetails(step, sessionRunning)
     }
 }
+
+/** Tools whose running call Claude Code can move to the background. */
+private val BACKGROUNDABLE = setOf("Bash", "PowerShell", "Agent", "Task")
 
 @Composable
 private fun StepDetails(step: Step, sessionRunning: Boolean) {

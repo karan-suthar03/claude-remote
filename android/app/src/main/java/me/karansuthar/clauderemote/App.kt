@@ -4,11 +4,16 @@ import android.app.Application
 import me.karansuthar.clauderemote.bridge.BridgeClient
 import me.karansuthar.clauderemote.data.Device
 import me.karansuthar.clauderemote.data.DeviceStore
+import me.karansuthar.clauderemote.data.Discovery
 import me.karansuthar.clauderemote.data.Settings
 
 class App : Application() {
     val settings: Settings by lazy { Settings(this) }
     val devices: DeviceStore by lazy { DeviceStore(this) }
+    val discovery = Discovery()
+
+    /** Looks for bridges on the tailnet (through the saved ones) not added yet. */
+    suspend fun discover() = discovery.refresh(devices.list(), ::client)
 
     private val clients = HashMap<String, BridgeClient>()
 

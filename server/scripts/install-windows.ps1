@@ -25,7 +25,9 @@ if (-not (Test-Path (Join-Path $server 'node_modules'))) {
 
 $envs = "`$env:PORT='$Port';"
 if ($WorkDir) { $envs += " `$env:WORK_DIR='$WorkDir';" }
-$cmd = "$envs Set-Location '$server'; & '$node' index.mjs *>> '$server\bridge.log'"
+# Task Scheduler's restart settings only cover a task that fails to start, so the task itself
+# starts the bridge again whenever it exits.
+$cmd = "$envs Set-Location '$server'; while (`$true) { & '$node' index.mjs *>> '$server\bridge.log'; Start-Sleep -Seconds 5 }"
 $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -WindowStyle Hidden -Command `"$cmd`""
 # The full account name (DOMAIN\user, or the PC name for local and Microsoft accounts); a bare
 # user name is rejected on many machines.

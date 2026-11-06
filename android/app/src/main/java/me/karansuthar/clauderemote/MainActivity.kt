@@ -20,6 +20,10 @@ import androidx.compose.runtime.saveable.Saver
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.repeatOnLifecycle
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import me.karansuthar.clauderemote.data.Device
 import me.karansuthar.clauderemote.ui.AddDeviceDialog
@@ -77,6 +81,19 @@ class MainActivity : ComponentActivity() {
     private fun Root() {
         val scope = rememberCoroutineScope()
         val devices by app.devices.devices.collectAsStateWithLifecycle()
+        val found by app.discovery.found.collectAsStateWithLifecycle()
+        val lifecycle = LocalLifecycleOwner.current.lifecycle
+
+        // Other computers on the tailnet running the bridge, found through the saved ones: checked
+        // while the app is in front, again whenever the saved devices change.
+        LaunchedEffect(devices) {
+            lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
+                while (true) {
+                    app.discover()
+                    delay(60_000)
+                }
+            }
+        }
         val drawerState = rememberDrawerState(DrawerValue.Closed)
 
         var selectedId by rememberSaveable {
@@ -129,6 +146,12 @@ class MainActivity : ComponentActivity() {
                         scope.launch { drawerState.close() }
                         showSettings = true
                     },
+                    found = found,
+                    onAddFound = { f ->
+                        val added = app.devices.add(f.url, "")
+                        app.discovery.forget(f.url)
+                        select(added)
+                    },
                 )
             },
         ) {
@@ -162,8 +185,10 @@ class MainActivity : ComponentActivity() {
         if (showAdd) {
             AddDeviceDialog(
                 onDismiss = { showAdd = false },
+                found = found,
                 onAdd = { url, name ->
                     val added = app.devices.add(url, name)
+                    app.discovery.forget(url)
                     showAdd = false
                     selectedId = added.id
                     screen = Screen.Device

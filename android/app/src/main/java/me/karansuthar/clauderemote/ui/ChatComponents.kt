@@ -41,6 +41,8 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberModalBottomSheetState
+import androidx.compose.foundation.gestures.scrollBy
+import androidx.compose.foundation.border
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -65,8 +67,10 @@ import androidx.compose.material3.SmallFloatingActionButton
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.snapshotFlow
+import androidx.compose.runtime.withFrameNanos
 import kotlinx.coroutines.flow.first
 import androidx.compose.ui.platform.LocalDensity
 import kotlinx.coroutines.launch
@@ -108,12 +112,22 @@ fun MessageList(
     /** Index of items[0] in the whole chat; > 0 means earlier items can be loaded. */
     start: Int = 0,
     onLoadEarlier: () -> Unit = {},
+    /** The current turn: when it started (this phone's clock) and its output tokens so far. */
+    turnStartedAt: Long = 0,
+    turnTokens: Int = 0,
+    /** Background tasks running right now. */
+    background: Int = 0,
+    /** Moves the command or subagent a running step started to the background (Ctrl+B). */
+    onBackground: ((String) -> Unit)? = null,
+    /** Opens the background tasks sheet. */
+    onTasks: () -> Unit = {},
 ) {
     val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
     val last = items.lastOrNull()
-    // A "working" row at the end while running and no reply has started yet.
-    val showWorking = running && last?.role != "assistant" && last?.role != "thinking"
+    // An activity row at the end for as long as Claude is working, like Claude Code's status line,
+    // so it is clear it hasn't stopped to wait for a message. Also while background tasks run.
+    val showWorking = running || background > 0
     val count = items.size + if (showWorking) 1 else 0
     val threshold = with(LocalDensity.current) { 48.dp.roundToPx() }
     val nearBottom by remember(listState, threshold) {
@@ -185,6 +199,34 @@ fun MessageList(
         }
     }
 
+    // Expanding a step shows what opened: scroll while it grows until its end is on screen, but
+    // never so far that its own header goes off the top.
+    // At the bottom, it stays at the bottom (the end of the chat, not just of the step).
+    val reveal: (Int) -> Unit = { key ->
+        val toEnd = nearBottom
+        scope.launch {
+            autoScrolling[0] = true
+            try {
+                repeat(40) {
+                    withFrameNanos { }
+                    val info = listState.layoutInfo
+                    val row = info.visibleItemsInfo.firstOrNull { it.key == key } ?: return@launch
+                    val bottom = info.viewportEndOffset - info.afterContentPadding
+                    val end = info.visibleItemsInfo.last()
+                    val overflow = when {
+                        !toEnd -> row.offset + row.size - bottom
+                        end.index == info.totalItemsCount - 1 -> end.offset + end.size - bottom
+                        else -> Int.MAX_VALUE
+                    }
+                    val by = minOf(overflow, row.offset - info.viewportStartOffset)
+                    if (by > 0) listState.scrollBy(by.toFloat())
+                }
+            } finally {
+                autoScrolling[0] = false
+            }
+        }
+    }
+
     Box(modifier) {
         LazyColumn(
             state = listState,
@@ -207,10 +249,15 @@ fun MessageList(
                     live = running && index == items.lastIndex,
                     running = running,
                     isExpanded = { id -> toggled[id] ?: alwaysExpandSteps },
-                    onToggle = { id -> toggled[id] = !(toggled[id] ?: alwaysExpandSteps) },
+                    onToggle = { id ->
+                        val open = !(toggled[id] ?: alwaysExpandSteps)
+                        toggled[id] = open
+                        if (open) reveal(start + index)
+                    },
+                    onBackground = onBackground,
                 )
             }
-            if (showWorking) item(key = "working", contentType = "working") { Working("Working…") }
+            if (showWorking) item(key = "working", contentType = "working") { Working(running, turnStartedAt, turnTokens, background, onTasks) }
         }
         if (!nearBottom && count > 0) {
             val hasNew = count > seenCount
@@ -244,14 +291,51 @@ fun MessageList(
     }
 }
 
+/** "Working… (1m 20s · ↓ 3.2k tokens)" while a turn runs, ticking every second. */
 @Composable
-private fun Working(label: String) {
-    Row(verticalAlignment = Alignment.CenterVertically) {
+private fun Working(running: Boolean, startedAt: Long, tokens: Int, background: Int, onTasks: () -> Unit) {
+    var now by remember { mutableLongStateOf(System.currentTimeMillis()) }
+    LaunchedEffect(running, startedAt) {
+        while (running && startedAt > 0) {
+            now = System.currentTimeMillis()
+            delay(1000 - now % 1000)
+        }
+    }
+    val tasks = if (background == 1) "1 background task" else "$background background tasks"
+    val label = if (running) {
+        val parts = buildList {
+            if (startedAt > 0) add(elapsedText(now - startedAt))
+            if (tokens > 0) add("↓ ${tokenText(tokens)} tokens")
+            if (background > 0) add(tasks)
+        }
+        if (parts.isEmpty()) "Working…" else "Working… (${parts.joinToString(" · ")})"
+    } else {
+        "$tasks running"
+    }
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier
+            .clip(RoundedCornerShape(6.dp))
+            .clickable(enabled = background > 0, onClickLabel = "Background tasks", onClick = onTasks)
+            .padding(vertical = 4.dp, horizontal = 2.dp),
+    ) {
         CircularProgressIndicator(Modifier.size(14.dp), strokeWidth = 2.dp)
         Spacer(Modifier.size(8.dp))
         Text(label, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.outline)
     }
 }
+
+private fun elapsedText(ms: Long): String {
+    val s = (ms / 1000).coerceAtLeast(0)
+    return when {
+        s < 60 -> "${s}s"
+        s < 3600 -> "${s / 60}m ${s % 60}s"
+        else -> "${s / 3600}h ${s / 60 % 60}m"
+    }
+}
+
+private fun tokenText(n: Int): String =
+    if (n < 1000) "$n" else String.format(java.util.Locale.US, "%.1fk", n / 1000.0)
 
 /** [live]: this is the reply being written now. */
 @Composable
@@ -261,6 +345,7 @@ private fun MessageBubble(
     running: Boolean,
     isExpanded: (String) -> Boolean,
     onToggle: (String) -> Unit,
+    onBackground: ((String) -> Unit)? = null,
 ) {
     when (item.role) {
         "user" -> Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.End) {
@@ -295,7 +380,13 @@ private fun MessageBubble(
         "thinking" -> ThinkingBlock(item.text, stillThinking = live)
         "step" -> item.step?.let { step ->
             key(step.id) {
-                StepView(step, sessionRunning = running, expanded = isExpanded(step.id), onToggle = { onToggle(step.id) })
+                StepView(
+                    step,
+                    sessionRunning = running,
+                    expanded = isExpanded(step.id),
+                    onToggle = { onToggle(step.id) },
+                    onBackground = onBackground?.let { f -> { f(step.id) } },
+                )
             }
         }
         else -> Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Center) {
@@ -576,6 +667,7 @@ fun SessionBar(
     onModelClick: () -> Unit,
     onEffort: (String) -> Unit,
     modifier: Modifier = Modifier,
+    onTasks: () -> Unit = {},
 ) {
     val current = remember(models, model) { models?.find { it.value == model } }
     val efforts = current?.efforts.orEmpty()
@@ -628,14 +720,25 @@ fun SessionBar(
             maxLines = 1,
         )
         if (background > 0) {
-            Text(
-                " · $background bg",
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.outline,
-                maxLines = 1,
-            )
-            Spacer(Modifier.size(4.dp))
-            CircularProgressIndicator(Modifier.size(10.dp), strokeWidth = 1.5.dp)
+            Spacer(Modifier.size(6.dp))
+            // Opens the background tasks: their output, and a stop button for each.
+            Row(
+                Modifier
+                    .clip(RoundedCornerShape(8.dp))
+                    .clickable(onClickLabel = "Background tasks", onClick = onTasks)
+                    .border(1.dp, MaterialTheme.colorScheme.outlineVariant, RoundedCornerShape(8.dp))
+                    .padding(horizontal = 8.dp, vertical = 4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                CircularProgressIndicator(Modifier.size(10.dp), strokeWidth = 1.5.dp)
+                Spacer(Modifier.size(4.dp))
+                Text(
+                    "$background bg",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                )
+            }
         }
     }
 }

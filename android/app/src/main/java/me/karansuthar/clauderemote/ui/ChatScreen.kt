@@ -14,6 +14,8 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Terminal
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -74,6 +76,23 @@ fun ChatScreen(app: App, device: Device, key: String, onBack: () -> Unit) {
     // The bridge's models, fetched once per screen (retried on reconnect until it works).
     var models by remember(session) { mutableStateOf<List<ModelInfo>?>(null) }
     var sheetOpen by remember { mutableStateOf(false) }
+    var tasksOpen by remember { mutableStateOf(false) }
+    // Ctrl+B: every running command and subagent, or just the step [id] started.
+    fun moveToBackground(id: String?) {
+        scope.launch {
+            val moved = runCatching { session.background(id) }
+            snackbar.showSnackbar(
+                when {
+                    moved.isFailure -> moved.exceptionOrNull()?.message ?: "Couldn't move it to the background"
+                    moved.getOrDefault(false) -> "Moved to the background. Claude carries on and is told when it finishes."
+                    else -> "Nothing is running that can go to the background."
+                },
+            )
+        }
+    }
+    // A message from the phone into a session still open in a terminal waits for a confirmation.
+    var terminalSend by remember { mutableStateOf<(() -> Unit)?>(null) }
+    var terminalCancel by remember { mutableStateOf<(() -> Unit)?>(null) }
     var changing by remember { mutableStateOf(false) }
     var defaultsChecked by remember(session) { mutableStateOf(false) }
 
@@ -180,6 +199,14 @@ fun ChatScreen(app: App, device: Device, key: String, onBack: () -> Unit) {
                                 },
                             )
                             DropdownMenuItem(
+                                text = { Text("Move to background") },
+                                enabled = state.running && !closed,
+                                onClick = {
+                                    menuOpen = false
+                                    moveToBackground(null)
+                                },
+                            )
+                            DropdownMenuItem(
                                 text = { Text("Close session") },
                                 enabled = !closed,
                                 onClick = {
@@ -211,6 +238,7 @@ fun ChatScreen(app: App, device: Device, key: String, onBack: () -> Unit) {
                         if (models == null) loadModels(report = true)
                     },
                     onEffort = { changeModel(null, it) },
+                    onTasks = { tasksOpen = true },
                 )
             }
             // A terminal session mirrored live; the bridge switches origin to "bridge" (a meta
@@ -239,19 +267,73 @@ fun ChatScreen(app: App, device: Device, key: String, onBack: () -> Unit) {
                             alwaysExpandSteps = alwaysExpandSteps,
                             start = state.start,
                             onLoadEarlier = session::loadEarlier,
+                            turnStartedAt = state.turnStartedAt,
+                            turnTokens = state.turnTokens,
+                            background = state.background,
+                            onBackground = if (state.isTerminal) null else { id -> moveToBackground(id) },
+                            onTasks = { tasksOpen = true },
                         )
                     }
                 }
             }
             InputBar(
                 running = state.running,
-                onSend = { text, images, onResult -> session.send(text, images, onResult) },
+                onSend = { text, images, onResult ->
+                    if (state.isTerminal && !state.closed) {
+                        terminalSend = { session.send(text, images, onResult) }
+                        terminalCancel = { onResult(false) }
+                    } else {
+                        session.send(text, images, onResult)
+                    }
+                },
                 onStop = session::interrupt,
                 onMessage = { message -> scope.launch { snackbar.showSnackbar(message) } },
                 enabled = !state.closed,
             )
         }
     }
+
+    if (tasksOpen) {
+        TasksSheet(
+            tasks = state.tasks,
+            session = session,
+            onMessage = { message -> scope.launch { snackbar.showSnackbar(message) } },
+            onDismiss = { tasksOpen = false },
+        )
+    }
+
+    terminalSend?.let { send ->
+        TerminalSendDialog(
+            onSend = {
+                terminalSend = null
+                terminalCancel = null
+                send()
+            },
+            onCancel = {
+                terminalCancel?.invoke()
+                terminalSend = null
+                terminalCancel = null
+            },
+        )
+    }
+}
+
+@Composable
+private fun TerminalSendDialog(onSend: () -> Unit, onCancel: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onCancel,
+        icon = { Icon(Icons.Default.Terminal, null) },
+        title = { Text("Close the terminal first") },
+        text = {
+            Text(
+                "This session is open in a terminal on the computer. Exit Claude Code there before " +
+                    "sending from the phone: if both keep going, they write to the same session and " +
+                    "the conversation gets mixed up.",
+            )
+        },
+        confirmButton = { Button(onClick = onSend) { Text("It's closed, send") } },
+        dismissButton = { TextButton(onClick = onCancel) { Text("Cancel") } },
+    )
 }
 
 /** Shown while the session is a terminal session on the computer, mirrored live. */
@@ -269,7 +351,7 @@ private fun TerminalBanner() {
                 modifier = Modifier.size(16.dp),
             )
             Text(
-                "Running in a terminal on this computer. You're watching it live; sending a message continues it here.",
+                "Open in a terminal on this computer, shown live. Exit Claude Code in the terminal before sending from the phone; don't use both at once.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(start = 10.dp).weight(1f),

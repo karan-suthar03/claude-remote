@@ -3,6 +3,7 @@ package me.karansuthar.clauderemote.ui
 import android.text.format.DateUtils
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -97,6 +98,7 @@ import kotlinx.coroutines.launch
 import me.karansuthar.clauderemote.App
 import me.karansuthar.clauderemote.BuildConfig
 import me.karansuthar.clauderemote.data.Device
+import me.karansuthar.clauderemote.data.FoundDevice
 import me.karansuthar.clauderemote.data.normalizeServerUrl
 import org.json.JSONArray
 import org.json.JSONObject
@@ -116,6 +118,8 @@ fun DeviceDrawer(
     onRename: (Device, String) -> Unit,
     onAdd: () -> Unit,
     onSettings: () -> Unit,
+    found: List<FoundDevice> = emptyList(),
+    onAddFound: (FoundDevice) -> Unit = {},
 ) {
     var confirmRemove by remember { mutableStateOf<Device?>(null) }
     var renaming by remember { mutableStateOf<Device?>(null) }
@@ -172,6 +176,22 @@ fun DeviceDrawer(
                         onRename = { renaming = device },
                         onRemove = { confirmRemove = device },
                     )
+                }
+                if (found.isNotEmpty()) {
+                    SectionLabel(
+                        "Available to add",
+                        modifier = Modifier.padding(start = 16.dp, end = 4.dp, top = 16.dp, bottom = 8.dp),
+                    )
+                    found.forEach { f ->
+                        NavigationDrawerItem(
+                            icon = { Icon(Icons.Default.Add, null) },
+                            label = { FoundDeviceLabel(f) },
+                            selected = false,
+                            onClick = { onAddFound(f) },
+                            colors = drawerItemColors(),
+                            modifier = Modifier.height(64.dp),
+                        )
+                    }
                 }
             }
 
@@ -312,6 +332,21 @@ private fun DrawerDeviceItem(
 }
 
 @Composable
+private fun FoundDeviceLabel(f: FoundDevice) {
+    Column {
+        Text(f.name, style = MaterialTheme.typography.titleSmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        Text(
+            f.subtitle,
+            style = MaterialTheme.typography.labelSmall,
+            fontFamily = MonoFamily,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+    }
+}
+
+@Composable
 private fun drawerItemColors() = NavigationDrawerItemDefaults.colors(
     selectedContainerColor = MaterialTheme.colorScheme.primaryContainer,
     unselectedContainerColor = Color.Transparent,
@@ -333,7 +368,11 @@ internal fun destructiveButtonColors() = ButtonDefaults.buttonColors(
 // ---------------------------------------------------------------- dialogs
 
 @Composable
-fun AddDeviceDialog(onDismiss: () -> Unit, onAdd: (url: String, name: String) -> Unit) {
+fun AddDeviceDialog(
+    onDismiss: () -> Unit,
+    onAdd: (url: String, name: String) -> Unit,
+    found: List<FoundDevice> = emptyList(),
+) {
     var address by rememberSaveable { mutableStateOf("") }
     var name by rememberSaveable { mutableStateOf("") }
     var error by remember { mutableStateOf<String?>(null) }
@@ -347,7 +386,20 @@ fun AddDeviceDialog(onDismiss: () -> Unit, onAdd: (url: String, name: String) ->
         onDismissRequest = onDismiss,
         title = { Text("Add device") },
         text = {
-            Column {
+            Column(Modifier.verticalScroll(rememberScrollState())) {
+                if (found.isNotEmpty()) {
+                    SectionLabel("Found on your tailnet", modifier = Modifier.padding(bottom = 4.dp))
+                    found.forEach { f ->
+                        ListItem(
+                            headlineContent = { Text(f.name, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                            supportingContent = { Text(f.subtitle, fontFamily = MonoFamily) },
+                            trailingContent = { Icon(Icons.Default.Add, "Add ${f.name}") },
+                            colors = androidx.compose.material3.ListItemDefaults.colors(containerColor = Color.Transparent),
+                            modifier = Modifier.clickable { onAdd(f.url, "") },
+                        )
+                    }
+                    SectionLabel("Or enter an address", modifier = Modifier.padding(top = 8.dp, bottom = 4.dp))
+                }
                 OutlinedTextField(
                     value = address,
                     onValueChange = { address = it; error = null },
