@@ -44,8 +44,10 @@ import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -65,6 +67,7 @@ import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.snapshotFlow
+import kotlinx.coroutines.flow.first
 import androidx.compose.ui.platform.LocalDensity
 import kotlinx.coroutines.launch
 import java.util.Locale
@@ -124,6 +127,35 @@ fun MessageList(
     var follow by remember { mutableStateOf(true) }
     val autoScrolling = remember { BooleanArray(1) }
     var seenCount by remember { mutableIntStateOf(0) }
+    // Steps the user opened or closed by hand; every other step follows the setting. Kept here,
+    // not in each row, so it survives rows scrolling away, and changing the setting resets it.
+    val toggled = remember { mutableStateMapOf<String, Boolean>() }
+    LaunchedEffect(alwaysExpandSteps) { toggled.clear() }
+
+    // Loading earlier messages keeps the view where it was: remember the first message on screen
+    // ([its key, its offset, start]) and put it back at the same spot once the older items arrive.
+    // Otherwise the list holds on to the "Load earlier" row and jumps to the top.
+    val anchor = remember { arrayOfNulls<IntArray>(1) }
+    val currentOnLoadEarlier by rememberUpdatedState(onLoadEarlier)
+    val loadEarlier: () -> Unit = {
+        val info = listState.layoutInfo.visibleItemsInfo.firstOrNull { it.key is Int }
+        anchor[0] = info?.let { intArrayOf(it.key as Int, it.offset, start) }
+        follow = false
+        currentOnLoadEarlier()
+    }
+    anchor[0]?.let { (key, offset, before) ->
+        if (start != before) {
+            anchor[0] = null
+            // Older items were prepended; the anchor's key (its place in the whole chat) still holds.
+            if (start < before) listState.requestScrollToItem(key - start + if (start > 0) 1 else 0, -offset)
+        }
+    }
+    // Scrolling up to the top loads the next older page by itself.
+    LaunchedEffect(listState, start) {
+        if (start <= 0) return@LaunchedEffect
+        snapshotFlow { listState.isScrollInProgress && listState.firstVisibleItemIndex == 0 }.first { it }
+        loadEarlier()
+    }
     // Only a scroll the user makes (drag or fling) away from the bottom stops following.
     LaunchedEffect(listState) {
         snapshotFlow { nearBottom }.collect { atBottom ->
@@ -165,7 +197,7 @@ fun MessageList(
             // other row skips recomposition.
             if (start > 0) item(key = "earlier", contentType = "earlier") {
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Center) {
-                    androidx.compose.material3.TextButton(onClick = onLoadEarlier) { Text("Load earlier messages ($start)") }
+                    androidx.compose.material3.TextButton(onClick = loadEarlier) { Text("Load earlier messages ($start)") }
                 }
             }
             // Keyed by position in the whole chat, so loading earlier items keeps every key stable.
@@ -174,7 +206,8 @@ fun MessageList(
                     item,
                     live = running && index == items.lastIndex,
                     running = running,
-                    alwaysExpandSteps = alwaysExpandSteps,
+                    isExpanded = { id -> toggled[id] ?: alwaysExpandSteps },
+                    onToggle = { id -> toggled[id] = !(toggled[id] ?: alwaysExpandSteps) },
                 )
             }
             if (showWorking) item(key = "working", contentType = "working") { Working("Working…") }
@@ -222,7 +255,13 @@ private fun Working(label: String) {
 
 /** [live]: this is the reply being written now. */
 @Composable
-private fun MessageBubble(item: ChatItem, live: Boolean, running: Boolean, alwaysExpandSteps: Boolean) {
+private fun MessageBubble(
+    item: ChatItem,
+    live: Boolean,
+    running: Boolean,
+    isExpanded: (String) -> Boolean,
+    onToggle: (String) -> Unit,
+) {
     when (item.role) {
         "user" -> Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.End) {
             Surface(
@@ -255,7 +294,9 @@ private fun MessageBubble(item: ChatItem, live: Boolean, running: Boolean, alway
         }
         "thinking" -> ThinkingBlock(item.text, stillThinking = live)
         "step" -> item.step?.let { step ->
-            key(step.id) { StepView(step, sessionRunning = running, defaultExpanded = alwaysExpandSteps) }
+            key(step.id) {
+                StepView(step, sessionRunning = running, expanded = isExpanded(step.id), onToggle = { onToggle(step.id) })
+            }
         }
         else -> Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Center) {
             Surface(

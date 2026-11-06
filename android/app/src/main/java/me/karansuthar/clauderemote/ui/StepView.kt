@@ -26,11 +26,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.saveable.rememberSaveable
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -46,10 +42,16 @@ import me.karansuthar.clauderemote.data.Step
 /**
  * One tool call: a header (status, tool, label, chevron) that toggles the full call and its
  * output. [sessionRunning] decides whether an unfinished step spins or is shown as stopped.
+ * The caller owns [expanded], so a change of the "always expand" setting reaches every step.
  */
 @Composable
-fun StepView(step: Step, sessionRunning: Boolean, defaultExpanded: Boolean, modifier: Modifier = Modifier) {
-    var expanded by rememberSaveable(step.id, defaultExpanded) { mutableStateOf(defaultExpanded) }
+fun StepView(
+    step: Step,
+    sessionRunning: Boolean,
+    expanded: Boolean,
+    onToggle: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
     val cs = MaterialTheme.colorScheme
     val lineColor = cs.outlineVariant
     val outer = if (step.sub) {
@@ -67,7 +69,7 @@ fun StepView(step: Step, sessionRunning: Boolean, defaultExpanded: Boolean, modi
             Modifier
                 .fillMaxWidth()
                 .clip(RoundedCornerShape(6.dp))
-                .clickable(onClickLabel = if (expanded) "Collapse" else "Expand") { expanded = !expanded }
+                .clickable(onClickLabel = if (expanded) "Collapse" else "Expand", onClick = onToggle)
                 .padding(horizontal = 2.dp, vertical = 4.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
