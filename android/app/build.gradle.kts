@@ -21,15 +21,17 @@ android {
     // A real release key, when one is provided (CI secrets or ~/.gradle/gradle.properties), so
     // every published APK can update the previous one. Without it, release builds use the
     // local debug key: fine for your own builds, but they can't update an installed release.
-    val keystore = System.getenv("CR_KEYSTORE") ?: (findProperty("crKeystore") as String?)
+    // CI passes unset secrets as empty strings, so treat blank values as not set.
+    fun setting(env: String, prop: String): String? =
+        System.getenv(env)?.takeIf { it.isNotBlank() } ?: (findProperty(prop) as String?)?.takeIf { it.isNotBlank() }
+    val keystore = setting("CR_KEYSTORE", "crKeystore")
     signingConfigs {
         if (keystore != null && file(keystore).exists()) {
             create("release") {
                 storeFile = file(keystore)
-                storePassword = System.getenv("CR_KEYSTORE_PASSWORD") ?: findProperty("crKeystorePassword") as String?
-                keyAlias = System.getenv("CR_KEY_ALIAS") ?: (findProperty("crKeyAlias") as String?) ?: "claude-remote"
-                keyPassword = System.getenv("CR_KEY_PASSWORD") ?: (findProperty("crKeyPassword") as String?)
-                    ?: (System.getenv("CR_KEYSTORE_PASSWORD") ?: findProperty("crKeystorePassword") as String?)
+                storePassword = setting("CR_KEYSTORE_PASSWORD", "crKeystorePassword")
+                keyAlias = setting("CR_KEY_ALIAS", "crKeyAlias") ?: "claude-remote"
+                keyPassword = setting("CR_KEY_PASSWORD", "crKeyPassword") ?: storePassword
             }
         }
     }
